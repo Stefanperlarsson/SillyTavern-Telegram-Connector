@@ -1,136 +1,136 @@
-## 关于项目
-非常抱歉，由于最近工作和生活上的事务越来越繁忙，我可能无法继续维护此项目。  
-本项目代码完全开源，欢迎任何人随时Fork并进行自己的开发和改进。  
-如果您对这个项目感兴趣，请随意将其作为您自己项目的起点，无需额外许可。  
-感谢您的理解与支持。
+## About This Project
+I apologize, but due to increasing work and life commitments, I may not be able to continue maintaining this project.  
+The project code is completely open source, and anyone is welcome to fork it and develop their own improvements.  
+If you are interested in this project, feel free to use it as a starting point for your own project without needing additional permission.  
+Thank you for your understanding and support.
 
 # SillyTavern Telegram Connector
 
-SillyTavern Telegram Connector 是一个为 SillyTavern 设计的扩展，允许用户通过 Telegram 与 SillyTavern 中的 AI 角色进行交互。该扩展建立了 SillyTavern 与 Telegram 机器人之间的桥接，使用户能够在移动设备上随时随地与他们喜爱的 AI 角色聊天。  
+SillyTavern Telegram Connector is an extension designed for SillyTavern that allows users to interact with AI characters in SillyTavern through Telegram. This extension creates a bridge between SillyTavern and a Telegram bot, enabling users to chat with their favorite AI characters anytime, anywhere on their mobile devices.  
 [![License](https://img.shields.io/github/license/qiqi20020612/SillyTavern-Telegram-Connector)](https://github.com/qiqi20020612/SillyTavern-Telegram-Connector/blob/main/LICENSE)
 [![stars](https://img.shields.io/github/stars/qiqi20020612/SillyTavern-Telegram-Connector)](https://github.com/qiqi20020612/SillyTavern-Telegram-Connector)
 
-## 功能特点
+## Features
 
-- **Telegram 集成**：通过 Telegram 应用与 SillyTavern 中的 AI 角色进行对话
-- **实时同步**：Telegram 中的对话会实时同步到 SillyTavern 界面，反之亦然
-- **命令支持**：提供多种 Telegram 命令，用于管理聊天和角色
-  - `/help` - 显示所有可用命令
-  - `/new` - 开始新的聊天
-  - `/listchars` - 列出所有可用角色
-  - `/switchchar <角色名称>` - 切换到指定角色
-  - `/listchats` - 列出当前角色的所有聊天记录
-  - `/switchchat <聊天名称>` - 切换到指定聊天记录
-- **简单配置**：通过 WebSocket 连接，易于设置和使用
+- **Telegram Integration**: Chat with AI characters in SillyTavern through the Telegram app
+- **Real-time Sync**: Conversations in Telegram sync in real-time to the SillyTavern interface, and vice versa
+- **Command Support**: Provides various Telegram commands for managing chats and characters
+  - `/help` - Show all available commands
+  - `/new` - Start a new chat
+  - `/listchars` - List all available characters
+  - `/switchchar <character name>` - Switch to specified character
+  - `/listchats` - List all chat logs for the current character
+  - `/switchchat <chat name>` - Switch to specified chat log
+- **Simple Configuration**: Easy to set up and use via WebSocket connection
 
-## 安装和使用
+## Installation and Usage
 
-### 扩展安装
+### Extension Installation
 
-1. 在 SillyTavern 中，导航至 "Extensions" 标签页
-2. 点击 "Install Extension"
-3. 输入以下 URL: `https://github.com/qiqi20020612/SillyTavern-Telegram-Connector`
-4. 点击 "Install" 按钮
-5. 安装完成后，重启 SillyTavern
+1. In SillyTavern, navigate to the "Extensions" tab
+2. Click "Install Extension"
+3. Enter the following URL: `https://github.com/qiqi20020612/SillyTavern-Telegram-Connector`
+4. Click the "Install" button
+5. After installation is complete, restart SillyTavern
 
-### 服务器设置
+### Server Setup
 
-1. 克隆或下载此仓库到您的计算机
-2. 进入 `server` 目录
-3. 安装依赖：
+1. Clone or download this repository to your computer
+2. Navigate to the `server` directory
+3. Install dependencies:
    ```
    npm install node-telegram-bot-api ws
    ```
-4. 复制 `config.example.js` 文件为 `config.js`：
+4. Copy the `config.example.js` file to `config.js`:
    ```
    cp config.example.js config.js
    ```
-   或在Windows系统中：
+   Or on Windows:
    ```
    copy config.example.js config.js
    ```
-5. 编辑 `config.js` 文件，将 `YOUR_TELEGRAM_BOT_TOKEN_HERE` 替换为您的 Telegram Bot Token
-   (可以通过 Telegram 的 [@BotFather](https://t.me/BotFather) 获取)
-6. 启动服务器：
+5. Edit the `config.js` file and replace `YOUR_TELEGRAM_BOT_TOKEN_HERE` with your Telegram Bot Token
+   (You can obtain it from [@BotFather](https://t.me/BotFather) on Telegram)
+6. Start the server:
    ```
    node server.js
    ```
 
-### 连接配置
+### Connection Configuration
 
-1. 在 SillyTavern 中，进入 "Extensions" 标签页
-2. 找到 "Telegram Connector" 部分
-3. 在 "Bridge 服务器 WebSocket URL" 字段中输入 WebSocket 服务器地址
-   (默认为 `ws://127.0.0.1:2333`)
-4. 点击 "连接" 按钮
-5. 状态显示 "已连接" 后，即可开始使用
+1. In SillyTavern, go to the "Extensions" tab
+2. Find the "Telegram Connector" section
+3. Enter the WebSocket server address in the "Bridge Server WebSocket URL" field
+   (Default is `ws://127.0.0.1:2333`)
+4. Click the "Connect" button
+5. Once the status shows "Connected", you can start using it
 
-### Telegram 使用方法
+### Using Telegram
 
-1. 在 Telegram 中，搜索并开始与您创建的机器人对话
-2. 发送任何消息开始聊天
-3. 您的消息将被发送到 SillyTavern，AI 的回复会自动发送回 Telegram
-4. 使用 `/help` 命令查看所有可用命令
+1. In Telegram, search for and start a conversation with the bot you created
+2. Send any message to start chatting
+3. Your messages will be sent to SillyTavern, and the AI's replies will automatically be sent back to Telegram
+4. Use the `/help` command to view all available commands
 
-## 系统要求
+## System Requirements
 
-- Node.js 14.0 或更高版本
-- 运行中的 SillyTavern 实例
-- 互联网连接（用于 Telegram API）
-- 如果服务器在公网访问，建议使用 HTTPS/WSS
+- Node.js 14.0 or higher
+- Running SillyTavern instance
+- Internet connection (for Telegram API)
+- If the server is publicly accessible, it is recommended to use HTTPS/WSS
 
-## 故障排除
+## Troubleshooting
 
-- **连接问题**：确保 WebSocket 服务器正在运行，并且 URL 配置正确
-- **Bot 无响应**：检查 Telegram Bot Token 是否正确，以及服务器日志中是否有错误
-- **消息不同步**：确保 SillyTavern 扩展已连接到 WebSocket 服务器
+- **Connection Issues**: Ensure the WebSocket server is running and the URL is configured correctly
+- **Bot Not Responding**: Check that the Telegram Bot Token is correct and review the server logs for errors
+- **Messages Not Syncing**: Ensure the SillyTavern extension is connected to the WebSocket server
 
-## 支持和贡献
+## Support and Contributions
 
-如果您遇到问题或有改进建议，请通过以下方式联系：
+If you encounter problems or have suggestions for improvements, please contact via:
 
-- 创建 GitHub Issue
-- 联系作者：ZMou
-- 访问作者主页：https://zmoutech.cn
+- Create a GitHub Issue
+- Contact the author: ZMou
+- Visit the author's homepage: https://zmoutech.cn
 
-欢迎提交 Pull Request 来改进此扩展！
+Pull Requests to improve this extension are welcome!
 
-## 许可证
+## License
 
-本项目采用 GNU General Public License v3.0 (GPL-3.0) 许可证 - 详情请参阅 LICENSE 文件
+This project is licensed under the GNU General Public License v3.0 (GPL-3.0) - see the LICENSE file for details
 
 ## TODO
 
-- **群聊功能增强**：
-  - [ ] 响应群聊中@bot的消息
+- **Group Chat Features**:
+  - [ ] Respond to @bot mentions in group chats
 
-- **媒体支持**：
-  - [ ] 支持发送图片
+- **Media Support**:
+  - [ ] Support for sending images
 
-- **消息格式**：
-  - [ ] 实现markdown转义
-  - [ ] Bot信息解析方式改为HTML 
+- **Message Formatting**:
+  - [ ] Implement markdown escaping
+  - [ ] Change bot message parsing to HTML format
 
-- **架构优化**：
-  - [x] 命令改为server处理，前端不再参与命令解析
-  - [ ] 将server转换为标准服务端插件，遵循[SillyTavern服务端插件规范](https://docs.sillytavern.app/for-contributors/server-plugins/)
+- **Architecture Improvements**:
+  - [x] Move command processing to server, frontend no longer participates in command parsing
+  - [ ] Convert server to standard server-side plugin following [SillyTavern server plugin specification](https://docs.sillytavern.app/for-contributors/server-plugins/)
 
-- **用户体验改进**：
-  - [x] 调整编辑消息的频率
-  - [x] 流式传输优化：生成足够字数后再显示初始信息
-  - [ ] "输入中"状态持续整个流式响应过程
-  - [x] 新增`/ping`命令，让用户随时查询Bridge连接状态和SillyTavern状态
+- **User Experience Improvements**:
+  - [x] Adjust message editing frequency
+  - [x] Streaming optimization: display initial message only after generating sufficient text
+  - [ ] "Typing" status persists throughout the entire streaming response
+  - [x] Add `/ping` command for users to check Bridge connection status and SillyTavern status
 
-- **设置菜单**：
-  - [ ] 扩展设置页新增白名单设置
-  - [ ] 控制当角色切换等网页活动时是否向Telegram发送通知
+- **Settings Menu**:
+  - [ ] Add whitelist settings to extension settings page
+  - [ ] Control whether to send Telegram notifications during webpage activities like character switching
 
-- **错误处理与稳定性**：
-  - [ ] `/exit`命令总是"退出操作超时，强制退出进程"
-  - [x] 处理ST中"停止生成"按钮点击事件（GENERATION_STOPPED而非GENERATION_ENDED）
-  - [ ] 处理正在生成时发送新消息的情况（拦截并提示用户正在生成中，不提交到ST）
-  - [ ] 在`/switchchar`或`/switchchat`命令后通知server清空旧缓存状态
+- **Error Handling and Stability**:
+  - [ ] `/exit` command always shows "Exit operation timeout, forcing process exit"
+  - [x] Handle "Stop Generation" button click event in ST (GENERATION_STOPPED instead of GENERATION_ENDED)
+  - [ ] Handle sending new message while generation is in progress (intercept and notify user, don't submit to ST)
+  - [ ] Notify server to clear old cached state after `/switchchar` or `/switchchat` commands
 
-- **技术优化**：
-  - [ ] 实现WebSocket心跳检测浏览器存活
-  - [ ] 优化setTimeout等待DOM更新的处理方式
+- **Technical Optimizations**:
+  - [ ] Implement WebSocket heartbeat to detect browser liveness
+  - [ ] Optimize setTimeout for waiting on DOM updates
