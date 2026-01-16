@@ -304,12 +304,6 @@ async function handleWebSocketMessage(event) {
             return;
         }
 
-        // --- System Command ---
-        if (data.type === 'system_command') {
-            handleSystemCommand(data);
-            return;
-        }
-
     } catch (error) {
         log('error', 'Error processing message:', error);
         if (data && data.chatId && data.botId) {
@@ -342,19 +336,6 @@ async function handleExecuteCommand(data) {
 
     try {
         switch (data.command) {
-            // --- Character Switch (queued) ---
-            case 'switchchar':
-                if (data.args && data.args.length > 0) {
-                    const targetName = data.args.join(' ');
-                    result = await switchToCharacter(targetName, chatId, botId, isQueuedSwitch);
-                } else {
-                    result = {
-                        success: false,
-                        message: 'No character name provided.'
-                    };
-                }
-                break;
-
             // --- New Chat ---
             case 'new':
                 await doNewChat({ deleteCurrentChat: false });
@@ -538,9 +519,11 @@ async function handleUserMessage(data) {
 
     // Trigger generation
     try {
+        log('log', 'Starting Generate() call...');
         const abortController = new AbortController();
         setExternalAbortController(abortController);
         await Generate('normal', { signal: abortController.signal });
+        log('log', 'Generate() call completed');
     } catch (error) {
         log('error', 'Generate() error:', error);
         errorOccurred = true;
@@ -566,19 +549,6 @@ async function handleUserMessage(data) {
     }
 }
 
-/**
- * Handles system commands from the server
- * @param {Object} data - System command data
- */
-function handleSystemCommand(data) {
-    log('log', 'Received system command:', data);
-
-    if (data.command === 'reload_ui_only') {
-        log('log', 'Refreshing UI...');
-        setTimeout(reloadPage, 500);
-    }
-}
-
 // ============================================================================
 // FINAL MESSAGE HANDLING
 // ============================================================================
@@ -589,8 +559,11 @@ function handleSystemCommand(data) {
  * @param {number} lastMessageIdInChatArray - Index of the last message in the chat array
  */
 function handleFinalMessage(lastMessageIdInChatArray) {
+    log('log', `handleFinalMessage called with index: ${lastMessageIdInChatArray}, activeRequest:`, activeRequest);
+    
     // Ensure we have an active request to respond to
     if (!ws || ws.readyState !== WebSocket.OPEN || !activeRequest) {
+        log('warn', `handleFinalMessage early return - ws: ${!!ws}, wsOpen: ${ws?.readyState === WebSocket.OPEN}, activeRequest: ${!!activeRequest}`);
         return;
     }
 

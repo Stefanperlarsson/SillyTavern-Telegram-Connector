@@ -703,7 +703,11 @@ wss.on('connection', ws => {
             data = JSON.parse(message);
 
             // --- Handle character switch confirmation ---
-            if (data.type === 'command_executed' && data.isQueuedSwitch) {
+            // Check for isQueuedSwitch flag OR switchchar command when we have a pending switch
+            const isPendingSwitch = activeJob && activeJob.switchResolve && !activeJob.characterSwitched;
+            const isSwitchResponse = data.isQueuedSwitch || (isPendingSwitch && data.command === 'switchchar');
+            
+            if (data.type === 'command_executed' && isSwitchResponse) {
                 if (activeJob && activeJob.switchResolve) {
                     if (data.success) {
                         logWithTimestamp('log', `Character switch to "${data.characterName || 'unknown'}" confirmed`);
@@ -721,7 +725,7 @@ wss.on('connection', ws => {
             }
 
             // --- Handle command execution results (non-switch) ---
-            if (data.type === 'command_executed' && !data.isQueuedSwitch) {
+            if (data.type === 'command_executed' && !isSwitchResponse) {
                 logWithTimestamp('log', `Command ${data.command} execution completed: ${data.success ? 'success' : 'failure'}`);
 
                 // Find the bot to send the response
