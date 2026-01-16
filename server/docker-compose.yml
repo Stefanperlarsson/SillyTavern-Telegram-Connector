@@ -6,12 +6,13 @@ services:
     container_name: st-telegram-bridge
     restart: unless-stopped
 
-    # Network mode - use host network for easy WebSocket access from browser
-    network_mode: host
+    ports:
+      - "2333:2333"
 
     volumes:
       # Mount config file
-      - /home/stefan/docker/SillyTavern-Telegram-Connector/server/config.js:/app/config.js:ro
+      # - /home/stefan/docker/SillyTavern-Telegram-Connector/server/config.js:/app/config.js:ro
+      - ./config.js:/app/config.js:ro
 
       # Optional: Mount for logs if you want to persist them
       # - ./logs:/app/logs
