@@ -737,7 +737,6 @@ async function handleFinalMessage(lastMessageIdInChatArray) {
                         images.push({
                             base64: imageData.base64,
                             mimeType: imageData.mimeType,
-                            caption: media.title || ''
                         });
                         log('log', `Prepared image for sending: ${imageData.mimeType}, ${imageData.base64.length} chars`);
                     }
