@@ -895,7 +895,6 @@ async function setupAndRunGeneration(chatId, botId, characterName, startMessageI
  */
 async function handleUserMessage(data) {
     log('log', 'Received user message for generation', data);
-    log('log', `Message has ${data.files?.length || 0} file attachment(s)`);
 
     const chatId = data.chatId;
     const botId = data.botId;
@@ -905,58 +904,64 @@ async function handleUserMessage(data) {
     let context = SillyTavern.getContext();
     const startMessageIndex = context.chat.length;
 
-    // Process file attachments if present
-    let fileExtras = null;
-    if (data.files && data.files.length > 0) {
-        log('log', `Processing ${data.files.length} file attachment(s)...`);
-        const uploadedFiles = await processFileAttachments(data.files);
-        if (uploadedFiles.length > 0) {
-            fileExtras = buildFileExtras(uploadedFiles);
+    // Normalize input to an array of messages
+    const messages = data.messages || [{ text: data.text, files: data.files }];
+    log('log', `Processing batch of ${messages.length} message(s)`);
+
+    for (const msg of messages) {
+        log('log', `Processing message: text="${msg.text?.substring(0, 20)}...", files=${msg.files?.length || 0}`);
+
+        // Process file attachments if present
+        let fileExtras = null;
+        if (msg.files && msg.files.length > 0) {
+            log('log', `Processing ${msg.files.length} file attachment(s)...`);
+            const uploadedFiles = await processFileAttachments(msg.files);
+            if (uploadedFiles.length > 0) {
+                fileExtras = buildFileExtras(uploadedFiles);
+            }
         }
-    }
 
-    // Add user message to SillyTavern
-    await sendMessageAsUser(data.text);
+        // Add user message to SillyTavern
+        await sendMessageAsUser(msg.text || '');
 
-    // If we have file attachments, add them to the user message we just created
-    if (fileExtras) {
-        // Refresh context to get the updated chat
-        context = SillyTavern.getContext();
-        const userMessageIndex = context.chat.length - 1;
-        const userMessage = context.chat[userMessageIndex];
-        
-        if (userMessage && userMessage.is_user) {
-            log('log', `Attaching file extras to user message at index ${userMessageIndex}`);
+        // If we have file attachments, add them to the user message we just created
+        if (fileExtras) {
+            // Refresh context to get the updated chat
+            context = SillyTavern.getContext();
+            const userMessageIndex = context.chat.length - 1;
+            const userMessage = context.chat[userMessageIndex];
             
-            // Merge file extras into the message's extra object
-            userMessage.extra = userMessage.extra || {};
-            Object.assign(userMessage.extra, fileExtras);
-            
-            log('log', `User message extra after merge:`, JSON.stringify(userMessage.extra, null, 2));
-            
-            // Render the media in the UI
-            try {
-                const messageElement = $(`#chat .mes[mesid="${userMessageIndex}"]`);
-                if (messageElement.length > 0) {
-                    appendMediaToMessage(userMessage, messageElement, false);
-                    log('log', `Media rendered in UI for message ${userMessageIndex}`);
-                } else {
-                    log('warn', `Could not find message element for index ${userMessageIndex}`);
+            if (userMessage && userMessage.is_user) {
+                log('log', `Attaching file extras to user message at index ${userMessageIndex}`);
+                
+                // Merge file extras into the message's extra object
+                userMessage.extra = userMessage.extra || {};
+                Object.assign(userMessage.extra, fileExtras);
+                
+                // Render the media in the UI
+                try {
+                    const messageElement = $(`#chat .mes[mesid="${userMessageIndex}"]`);
+                    if (messageElement.length > 0) {
+                        appendMediaToMessage(userMessage, messageElement, false);
+                        log('log', `Media rendered in UI for message ${userMessageIndex}`);
+                    } else {
+                        log('warn', `Could not find message element for index ${userMessageIndex}`);
+                    }
+                } catch (renderError) {
+                    log('error', `Failed to render media: ${renderError.message}`);
                 }
-            } catch (renderError) {
-                log('error', `Failed to render media: ${renderError.message}`);
+                
+                // Save the chat to persist the changes
+                try {
+                    const { saveChatConditional } = await import("../../../../script.js");
+                    await saveChatConditional();
+                    log('log', `Chat saved with file attachments`);
+                } catch (saveError) {
+                    log('error', `Failed to save chat: ${saveError.message}`);
+                }
+            } else {
+                log('warn', `Could not find user message to attach files. Index: ${userMessageIndex}, is_user: ${userMessage?.is_user}`);
             }
-            
-            // Save the chat to persist the changes
-            try {
-                const { saveChatConditional } = await import("../../../../script.js");
-                await saveChatConditional();
-                log('log', `Chat saved with file attachments`);
-            } catch (saveError) {
-                log('error', `Failed to save chat: ${saveError.message}`);
-            }
-        } else {
-            log('warn', `Could not find user message to attach files. Index: ${userMessageIndex}, is_user: ${userMessage?.is_user}`);
         }
     }
 

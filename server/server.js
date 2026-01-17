@@ -98,6 +98,47 @@ function logWithTimestamp(level, ...args) {
     }
 }
 
+/**
+ * Formats a Unix timestamp to YYYY-MM-DD HH:mm:ss
+ * @param {number} unixTimestamp - Unix timestamp in seconds
+ * @returns {string} Formatted date string
+ */
+function formatTimestamp(unixTimestamp) {
+    const date = new Date(unixTimestamp * 1000);
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    const hours = String(date.getHours()).padStart(2, '0');
+    const minutes = String(date.getMinutes()).padStart(2, '0');
+    const seconds = String(date.getSeconds()).padStart(2, '0');
+    return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
+}
+
+/**
+ * Strips the timestamp from the bot's response using the configured regex
+ * @param {string} text - The text to sanitize
+ * @returns {string} Sanitized text
+ */
+function sanitizeBotMessage(text) {
+    if (!config.behavior || !config.behavior.botMessageFilterRegex) return text;
+    try {
+        const regex = new RegExp(config.behavior.botMessageFilterRegex);
+        return text.replace(regex, '');
+    } catch (e) {
+        logWithTimestamp('error', 'Invalid botMessageFilterRegex:', e.message);
+        return text;
+    }
+}
+
+/**
+ * Gets the message split character from config
+ * @returns {string|null} The split character or null if disabled
+ */
+function getMessageSplitChar() {
+    if (!config.behavior || !config.behavior.messageSplitChar) return null;
+    return config.behavior.messageSplitChar;
+}
+
 // ============================================================================
 // RESTART PROTECTION
 // ============================================================================
@@ -200,6 +241,88 @@ const wssPort = config.wssPort || 2333;
 // ============================================================================
 // REQUEST QUEUE & MUTEX SYSTEM
 // ============================================================================
+
+// ============================================================================
+// MESSAGE BATCHING & DEBOUNCE
+// ============================================================================
+
+const DEBOUNCE_MS = (config.behavior && config.behavior.debounceSeconds ? config.behavior.debounceSeconds : 10) * 1000;
+
+/** 
+ * Buffers for user messages
+ * Key: chatId (number)
+ * Value: { timer: NodeJS.Timeout, messages: Array<{text, files}>, bot: ManagedBot, userId: number, targetCharacter: string }
+ * @type {Map<number, Object>} 
+ */
+const userMessageBuffers = new Map();
+
+/**
+ * Adds a user message to the buffer and resets the debounce timer
+ * @param {ManagedBot} bot - The bot receiving the message
+ * @param {number} chatId - Telegram chat ID
+ * @param {number} userId - Telegram user ID
+ * @param {string} text - Message text
+ * @param {FileAttachment[]} [files] - File attachments
+ */
+function debounceUserMessage(bot, chatId, userId, text, files) {
+    let buffer = userMessageBuffers.get(chatId);
+
+    if (buffer) {
+        clearTimeout(buffer.timer);
+    } else {
+        buffer = {
+            messages: [],
+            bot: bot,
+            userId: userId,
+            targetCharacter: bot.characterName
+        };
+        userMessageBuffers.set(chatId, buffer);
+    }
+
+    if (text || (files && files.length > 0)) {
+        buffer.messages.push({
+            text: text,
+            files: files
+        });
+        logWithTimestamp('log', `Buffered message for chat ${chatId} (buffer size: ${buffer.messages.length})`);
+    }
+
+    buffer.timer = setTimeout(() => {
+        flushUserMessageBuffer(chatId);
+    }, DEBOUNCE_MS);
+}
+
+/**
+ * Flushes the message buffer for a chat, creating a single batch job
+ * @param {number} chatId - The chat ID to flush
+ */
+function flushUserMessageBuffer(chatId) {
+    const buffer = userMessageBuffers.get(chatId);
+    if (!buffer) return;
+
+    userMessageBuffers.delete(chatId);
+
+    if (buffer.messages.length === 0) return;
+
+    logWithTimestamp('log', `Flushing buffer for chat ${chatId} with ${buffer.messages.length} messages`);
+
+    const lastMsg = buffer.messages[buffer.messages.length - 1];
+    
+    const job = {
+        id: '', 
+        bot: buffer.bot,
+        chatId: chatId,
+        userId: buffer.userId,
+        text: lastMsg.text || '(Batch Request)',
+        targetCharacter: buffer.targetCharacter,
+        type: 'message',
+        messages: buffer.messages,
+        files: undefined,
+        timestamp: 0
+    };
+
+    enqueueJob(job);
+}
 
 /** @type {QueueJob[]} */
 const requestQueue = [];
@@ -379,47 +502,56 @@ async function sendUserMessage(job) {
     job.bot.instance.sendChatAction(job.chatId, 'typing')
         .catch(err => logWithTimestamp('error', 'Failed to send typing action:', err.message));
 
-    // Download any file attachments
-    let fileAttachments = undefined;
-    if (job.files && job.files.length > 0) {
-        logWithTimestamp('log', `Downloading ${job.files.length} file(s) from Telegram...`);
-        fileAttachments = [];
+    // Prepare messages array for payload
+    const payloadMessages = [];
+    
+    // Check if it's a batch job or legacy single job
+    const sourceMessages = job.messages || [{ text: job.text, files: job.files }];
+
+    for (const msg of sourceMessages) {
+        let fileAttachments = undefined;
         
-        for (const file of job.files) {
-            const downloaded = await downloadTelegramFile(
-                job.bot.instance,
-                file.fileId,
-                file.fileName,
-                file.mimeType
-            );
+        if (msg.files && msg.files.length > 0) {
+            logWithTimestamp('log', `Downloading ${msg.files.length} file(s) from Telegram...`);
+            fileAttachments = [];
             
-            if (downloaded) {
-                fileAttachments.push(downloaded);
-                logWithTimestamp('log', `Successfully downloaded: ${file.fileName}`);
-            } else {
-                logWithTimestamp('error', `Failed to download: ${file.fileName}`);
+            for (const file of msg.files) {
+                const downloaded = await downloadTelegramFile(
+                    job.bot.instance,
+                    file.fileId,
+                    file.fileName,
+                    file.mimeType
+                );
+                
+                if (downloaded) {
+                    fileAttachments.push(downloaded);
+                    logWithTimestamp('log', `Successfully downloaded: ${file.fileName}`);
+                } else {
+                    logWithTimestamp('error', `Failed to download: ${file.fileName}`);
+                }
+            }
+            
+            if (fileAttachments.length === 0) {
+                fileAttachments = undefined;
             }
         }
         
-        logWithTimestamp('log', `Downloaded ${fileAttachments.length}/${job.files.length} files`);
-        
-        // Only include if we have files
-        if (fileAttachments.length === 0) {
-            fileAttachments = undefined;
-        }
+        payloadMessages.push({
+            text: msg.text,
+            files: fileAttachments
+        });
     }
 
     // Send the message to SillyTavern
     const payload = {
         type: 'user_message',
         chatId: job.chatId,
-        text: job.text,
         botId: job.bot.id,
         characterName: job.targetCharacter,
-        files: fileAttachments,
+        messages: payloadMessages
     };
     
-    logWithTimestamp('log', `Sending to SillyTavern: text="${job.text.substring(0, 30)}...", files=${fileAttachments?.length || 0}`);
+    logWithTimestamp('log', `Sending to SillyTavern: ${payloadMessages.length} messages`);
     sillyTavernClient.send(JSON.stringify(payload));
 }
 
@@ -626,6 +758,7 @@ function processMediaGroup(groupKey) {
     const allFiles = [];
     let caption = '';
     
+    // Find the caption and apply timestamp if needed
     for (const msg of group.messages) {
         const files = extractFileAttachments(msg);
         allFiles.push(...files);
@@ -633,25 +766,32 @@ function processMediaGroup(groupKey) {
         // Use caption from first message that has one
         if (!caption && msg.caption) {
             caption = msg.caption;
+            
+            // Apply timestamp if configured
+            if (config.behavior && config.behavior.userMessageFormat) {
+                const dateStr = formatTimestamp(msg.date);
+                const timestampPrefix = config.behavior.userMessageFormat.replace('{{date}}', dateStr);
+                caption = timestampPrefix + caption;
+            }
         }
+    }
+    
+    // If no caption was found but we want timestamps, use the timestamp of the first message
+    if (!caption && config.behavior && config.behavior.userMessageFormat && group.messages.length > 0) {
+         const firstMsg = group.messages[0];
+         const dateStr = formatTimestamp(firstMsg.date);
+         caption = config.behavior.userMessageFormat.replace('{{date}}', dateStr);
     }
     
     logWithTimestamp('log', `Processing media group: ${group.messages.length} messages, ${allFiles.length} files, caption="${caption.substring(0, 30)}..."`);
     
-    // Create a single job with all files
-    const job = {
-        id: '',
-        bot: group.bot,
-        chatId: group.chatId,
-        userId: group.userId,
-        text: caption,
-        targetCharacter: group.bot.characterName,
-        type: 'message',
-        files: allFiles.length > 0 ? allFiles : undefined,
-        timestamp: 0
-    };
-    
-    enqueueJob(job);
+    debounceUserMessage(
+        group.bot, 
+        group.chatId, 
+        group.userId, 
+        caption, 
+        allFiles.length > 0 ? allFiles : undefined
+    );
 }
 
 /**
@@ -708,10 +848,21 @@ function setupBotHandlers(managedBot) {
         }
 
         // Extract text - use caption for media messages, otherwise use text
-        const text = msg.text || msg.caption || '';
-        
+        let text = msg.text || msg.caption || '';
+
         // Extract file attachments
         const files = extractFileAttachments(msg);
+        
+        // Apply timestamp if configured
+        if (config.behavior && config.behavior.userMessageFormat) {
+            const dateStr = formatTimestamp(msg.date);
+            const timestampPrefix = config.behavior.userMessageFormat.replace('{{date}}', dateStr);
+            
+            // If we have text, prepend. If we have only files but no text, add the timestamp as text.
+            if (text || files.length > 0) {
+                text = timestampPrefix + text;
+            }
+        }
         
         // Log what we received
         logWithTimestamp('log', `Received message for "${managedBot.characterName}" from user ${userId}: text="${text.substring(0, 50)}${text.length > 50 ? '...' : ''}", files=${files.length}`);
@@ -728,21 +879,8 @@ function setupBotHandlers(managedBot) {
             return;
         }
 
-        // Handle regular messages - enqueue for processing
-        /** @type {QueueJob} */
-        const job = {
-            id: '', // Will be set by enqueueJob
-            bot: managedBot,
-            chatId: chatId,
-            userId: userId,
-            text: text,
-            targetCharacter: managedBot.characterName,
-            type: 'message',
-            files: files.length > 0 ? files : undefined,
-            timestamp: 0 // Will be set by enqueueJob
-        };
-
-        enqueueJob(job);
+        // Handle regular messages - buffer for batching
+        debounceUserMessage(managedBot, chatId, userId, text, files.length > 0 ? files : undefined);
     });
 }
 
@@ -1113,6 +1251,11 @@ wss.on('connection', ws => {
         let data;
         try {
             data = JSON.parse(message);
+            
+            // Sanitize bot output if it's a message from ST to Telegram
+            if (data.text && (data.type === 'stream_chunk' || data.type === 'final_message_update' || data.type === 'ai_reply')) {
+                data.text = sanitizeBotMessage(data.text);
+            }
 
             // --- Handle character switch confirmation ---
             // Check for isQueuedSwitch flag OR switchchar/switchmodel command when we have a pending switch
@@ -1192,7 +1335,7 @@ wss.on('connection', ws => {
                     session.lastText = data.text;
                 }
 
-                // Throttled edit
+                // Throttled edit - only show the first part during streaming
                 const messageId = await session.messagePromise;
 
                 if (messageId && !session.isEditing && !session.timer) {
@@ -1202,7 +1345,12 @@ wss.on('connection', ws => {
                             const currentMessageId = await currentSession.messagePromise;
                             if (currentMessageId) {
                                 currentSession.isEditing = true;
-                                bot.instance.editMessageText(currentSession.lastText + ' ...', {
+                                // Only display the first part during streaming to avoid showing full text
+                                const splitChar = getMessageSplitChar();
+                                const firstPart = splitChar 
+                                    ? currentSession.lastText.split(splitChar)[0] 
+                                    : currentSession.lastText;
+                                bot.instance.editMessageText(firstPart + ' ...', {
                                     chat_id: data.chatId,
                                     message_id: currentMessageId,
                                 }).catch(err => {
@@ -1254,25 +1402,56 @@ wss.on('connection', ws => {
                     await sendImagesToTelegram(bot, data.chatId, data.images);
                 }
 
+                // Split by configured character to support multi-message responses
+                const splitChar = getMessageSplitChar();
+                const parts = splitChar ? data.text.split(splitChar) : [data.text];
+                
+                // Find the first non-empty part to use as the "anchor" (editing the existing streaming message)
+                let anchorIndex = -1;
+                for (let i = 0; i < parts.length; i++) {
+                    if (parts[i].trim().length > 0) {
+                        anchorIndex = i;
+                        break;
+                    }
+                }
+
                 if (session) {
                     const messageId = await session.messagePromise;
                     if (messageId) {
-                        logWithTimestamp('log', `Sending final streamed message update`);
-                        await bot.instance.editMessageText(data.text, {
-                            chat_id: data.chatId,
-                            message_id: messageId,
-                        }).catch(err => {
-                            if (!err.message.includes('message is not modified'))
-                                logWithTimestamp('error', 'Failed to edit final message:', err.message);
-                        });
+                        if (anchorIndex !== -1) {
+                            logWithTimestamp('log', `Sending final streamed message update (Anchor: part ${anchorIndex})`);
+                            await bot.instance.editMessageText(parts[anchorIndex], {
+                                chat_id: data.chatId,
+                                message_id: messageId,
+                            }).catch(err => {
+                                if (!err.message.includes('message is not modified'))
+                                    logWithTimestamp('error', 'Failed to edit final message:', err.message);
+                            });
+                        } else {
+                            // If response is completely empty/whitespace, log a warning
+                            logWithTimestamp('warn', 'Final response text is empty or whitespace only.');
+                        }
                     }
                     ongoingStreams.delete(streamKey);
                     logWithTimestamp('log', `Streaming session ${streamKey} completed`);
                 } else {
-                    // Non-streaming reply
-                    logWithTimestamp('log', `Sending non-streaming reply`);
-                    await bot.instance.sendMessage(data.chatId, data.text)
-                        .catch(err => logWithTimestamp('error', 'Failed to send final message:', err.message));
+                    // Non-streaming fallback - send anchor as new message
+                    if (anchorIndex !== -1) {
+                        logWithTimestamp('log', `Sending non-streaming reply (Anchor)`);
+                        await bot.instance.sendMessage(data.chatId, parts[anchorIndex])
+                            .catch(err => logWithTimestamp('error', 'Failed to send final message:', err.message));
+                    }
+                }
+
+                // Send remaining parts as new messages
+                if (anchorIndex !== -1) {
+                    for (let i = anchorIndex + 1; i < parts.length; i++) {
+                        if (parts[i].trim().length > 0) {
+                            logWithTimestamp('log', `Sending split message part ${i}`);
+                            await bot.instance.sendMessage(data.chatId, parts[i])
+                                .catch(err => logWithTimestamp('error', 'Failed to send split message:', err.message));
+                        }
+                    }
                 }
 
                 // Release the job lock
@@ -1294,9 +1473,18 @@ wss.on('connection', ws => {
                     await sendImagesToTelegram(bot, data.chatId, data.images);
                 }
 
-                logWithTimestamp('log', `Sending non-streaming AI reply`);
-                await bot.instance.sendMessage(data.chatId, data.text)
-                    .catch(err => logWithTimestamp('error', 'Failed to send AI reply:', err.message));
+                // Split by configured character to support multi-message responses
+                const splitChar = getMessageSplitChar();
+                const parts = splitChar ? data.text.split(splitChar) : [data.text];
+                
+                logWithTimestamp('log', `Sending non-streaming AI reply${splitChar ? ' (split by configured char)' : ''}`);
+                
+                for (const part of parts) {
+                    if (part.trim().length > 0) {
+                        await bot.instance.sendMessage(data.chatId, part)
+                            .catch(err => logWithTimestamp('error', 'Failed to send AI reply part:', err.message));
+                    }
+                }
 
                 releaseJob();
                 return;
