@@ -336,6 +336,19 @@ async function handleExecuteCommand(data) {
 
     try {
         switch (data.command) {
+            // --- Character Switch (queued) ---
+            case 'switchchar':
+                if (data.args && data.args.length > 0) {
+                    const targetName = data.args.join(' ');
+                    result = await switchToCharacter(targetName, chatId, botId, isQueuedSwitch);
+                } else {
+                    result = {
+                        success: false,
+                        message: 'No character name provided.'
+                    };
+                }
+                break;
+
             // --- New Chat ---
             case 'new':
                 await doNewChat({ deleteCurrentChat: false });
