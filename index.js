@@ -8,6 +8,7 @@ const {
     extensionSettings,
     deleteLastMessage,
     saveSettingsDebounced,
+    executeSlashCommands,
 } = SillyTavern.getContext();
 
 // Import all needed public API functions from script.js
@@ -22,7 +23,6 @@ import {
     Generate,
     setExternalAbortController,
     appendMediaToMessage,
-    executeSlashCommands,
 } from "../../../../script.js";
 
 // Import utility functions for file handling
