@@ -62,6 +62,14 @@ Each bot automatically switches SillyTavern to its configured character before p
    module.exports = {
        wssPort: 2333,
        allowedUserIds: [123456789], // Your Telegram user ID (get from @userinfobot)
+       
+       // Behavior Configuration (Optional)
+       behavior: {
+           debounceSeconds: 10, // Wait time for message batching
+           userMessageFormat: '<div class="timestamp">[{{date}}]</div> ', // Timestamp format
+           botMessageFilterRegex: '^<div class="timestamp">.*?<\\/div>\\s*' // Strip timestamp from bot reply
+       },
+       
        bots: [
            {
                token: 'BOT_TOKEN_FROM_BOTFATHER',
