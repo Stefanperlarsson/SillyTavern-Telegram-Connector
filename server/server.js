@@ -27,6 +27,13 @@ const path = require('path');
  */
 
 /**
+ * @typedef {Object} FileAttachment
+ * @property {string} fileId - Telegram file ID
+ * @property {string} fileName - Original file name
+ * @property {string} mimeType - MIME type of the file
+ */
+
+/**
  * @typedef {Object} QueueJob
  * @property {string} id - Unique job identifier
  * @property {ManagedBot} bot - The bot that received the message
@@ -37,6 +44,7 @@ const path = require('path');
  * @property {'message' | 'command'} type - Job type
  * @property {string} [command] - Command name (if type is 'command')
  * @property {string[]} [args] - Command arguments (if type is 'command')
+ * @property {FileAttachment[]} [files] - File attachments from Telegram
  * @property {number} timestamp - When the job was created
  */
 
@@ -325,14 +333,48 @@ async function sendUserMessage(job) {
     job.bot.instance.sendChatAction(job.chatId, 'typing')
         .catch(err => logWithTimestamp('error', 'Failed to send typing action:', err.message));
 
+    // Download any file attachments
+    let fileAttachments = undefined;
+    if (job.files && job.files.length > 0) {
+        logWithTimestamp('log', `Downloading ${job.files.length} file(s) from Telegram...`);
+        fileAttachments = [];
+        
+        for (const file of job.files) {
+            const downloaded = await downloadTelegramFile(
+                job.bot.instance,
+                file.fileId,
+                file.fileName,
+                file.mimeType
+            );
+            
+            if (downloaded) {
+                fileAttachments.push(downloaded);
+                logWithTimestamp('log', `Successfully downloaded: ${file.fileName}`);
+            } else {
+                logWithTimestamp('error', `Failed to download: ${file.fileName}`);
+            }
+        }
+        
+        logWithTimestamp('log', `Downloaded ${fileAttachments.length}/${job.files.length} files`);
+        
+        // Only include if we have files
+        if (fileAttachments.length === 0) {
+            fileAttachments = undefined;
+        }
+    }
+
     // Send the message to SillyTavern
-    sillyTavernClient.send(JSON.stringify({
+    const payload = {
         type: 'user_message',
         chatId: job.chatId,
         text: job.text,
         botId: job.bot.id,
-        characterName: job.targetCharacter
-    }));
+        characterName: job.targetCharacter,
+        files: fileAttachments,
+    };
+    
+    logWithTimestamp('log', `Sending to SillyTavern: text="${job.text.substring(0, 30)}...", files=${fileAttachments?.length || 0}`);
+    sillyTavernClient.send(JSON.stringify(payload));
 }
 
 /**
@@ -505,7 +547,6 @@ async function clearAndStartPollingAll() {
 function setupBotHandlers(managedBot) {
     managedBot.instance.on('message', (msg) => {
         const chatId = msg.chat.id;
-        const text = msg.text;
         const userId = msg.from.id;
         const username = msg.from.username || 'N/A';
 
@@ -519,10 +560,23 @@ function setupBotHandlers(managedBot) {
             }
         }
 
-        if (!text) return;
+        // Extract text - use caption for media messages, otherwise use text
+        const text = msg.text || msg.caption || '';
+        
+        // Extract file attachments
+        const files = extractFileAttachments(msg);
+        
+        // Log what we received
+        logWithTimestamp('log', `Received message for "${managedBot.characterName}" from user ${userId}: text="${text.substring(0, 50)}${text.length > 50 ? '...' : ''}", files=${files.length}`);
 
-        // Handle commands
-        if (text.startsWith('/')) {
+        // If no text and no files, ignore
+        if (!text && files.length === 0) {
+            logWithTimestamp('log', `Ignoring empty message (no text, no files)`);
+            return;
+        }
+
+        // Handle commands (only if it's a text-only message starting with /)
+        if (text.startsWith('/') && files.length === 0) {
             handleBotCommand(managedBot, msg);
             return;
         }
@@ -537,10 +591,10 @@ function setupBotHandlers(managedBot) {
             text: text,
             targetCharacter: managedBot.characterName,
             type: 'message',
+            files: files.length > 0 ? files : undefined,
             timestamp: 0 // Will be set by enqueueJob
         };
 
-        logWithTimestamp('log', `Received message for "${managedBot.characterName}" from user ${userId}: "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`);
         enqueueJob(job);
     });
 }
@@ -714,6 +768,129 @@ async function sendImagesToTelegram(bot, chatId, images) {
             logWithTimestamp('error', `Failed to send image: ${err.message}`);
         }
     }
+}
+
+/**
+ * Downloads a file from Telegram and converts to base64
+ * @param {TelegramBot} botInstance - Bot instance
+ * @param {string} fileId - Telegram file ID
+ * @param {string} fileName - Original file name
+ * @param {string} mimeType - MIME type
+ * @returns {Promise<{base64: string, mimeType: string, fileName: string}|null>}
+ */
+async function downloadTelegramFile(botInstance, fileId, fileName, mimeType) {
+    try {
+        logWithTimestamp('log', `Downloading file from Telegram: ${fileName} (${mimeType})`);
+        
+        // Get file link from Telegram
+        const fileLink = await botInstance.getFileLink(fileId);
+        logWithTimestamp('log', `Got file link: ${fileLink}`);
+        
+        // Fetch the file
+        const response = await fetch(fileLink);
+        if (!response.ok) {
+            logWithTimestamp('error', `Failed to fetch file: ${response.status} ${response.statusText}`);
+            return null;
+        }
+        
+        // Get the buffer - need to handle both Node 18+ and older versions
+        const arrayBuffer = await response.arrayBuffer();
+        const buffer = Buffer.from(arrayBuffer);
+        
+        // Convert to base64
+        const base64 = buffer.toString('base64');
+        
+        logWithTimestamp('log', `Downloaded file: ${fileName}, size: ${buffer.length} bytes, base64 length: ${base64.length}`);
+        
+        return { base64, mimeType, fileName };
+    } catch (error) {
+        logWithTimestamp('error', `Error downloading file from Telegram: ${error.message}`);
+        return null;
+    }
+}
+
+/**
+ * Extracts file attachments from a Telegram message
+ * @param {Object} msg - Telegram message object
+ * @returns {FileAttachment[]} Array of file attachments
+ */
+function extractFileAttachments(msg) {
+    const files = [];
+    
+    // Photos - array of sizes, pick largest (last)
+    if (msg.photo && msg.photo.length > 0) {
+        const photo = msg.photo[msg.photo.length - 1];
+        files.push({
+            fileId: photo.file_id,
+            fileName: 'photo.jpg',
+            mimeType: 'image/jpeg'
+        });
+        logWithTimestamp('log', `Found photo attachment: ${photo.file_id}`);
+    }
+    
+    // Documents (generic files)
+    if (msg.document) {
+        files.push({
+            fileId: msg.document.file_id,
+            fileName: msg.document.file_name || 'document',
+            mimeType: msg.document.mime_type || 'application/octet-stream'
+        });
+        logWithTimestamp('log', `Found document attachment: ${msg.document.file_name} (${msg.document.mime_type})`);
+    }
+    
+    // Videos
+    if (msg.video) {
+        files.push({
+            fileId: msg.video.file_id,
+            fileName: msg.video.file_name || 'video.mp4',
+            mimeType: msg.video.mime_type || 'video/mp4'
+        });
+        logWithTimestamp('log', `Found video attachment: ${msg.video.file_name || 'video.mp4'}`);
+    }
+    
+    // Audio files
+    if (msg.audio) {
+        files.push({
+            fileId: msg.audio.file_id,
+            fileName: msg.audio.file_name || 'audio.mp3',
+            mimeType: msg.audio.mime_type || 'audio/mpeg'
+        });
+        logWithTimestamp('log', `Found audio attachment: ${msg.audio.file_name || 'audio.mp3'}`);
+    }
+    
+    // Voice messages
+    if (msg.voice) {
+        files.push({
+            fileId: msg.voice.file_id,
+            fileName: 'voice.ogg',
+            mimeType: msg.voice.mime_type || 'audio/ogg'
+        });
+        logWithTimestamp('log', `Found voice message attachment`);
+    }
+    
+    // Video notes (round video messages)
+    if (msg.video_note) {
+        files.push({
+            fileId: msg.video_note.file_id,
+            fileName: 'video_note.mp4',
+            mimeType: 'video/mp4'
+        });
+        logWithTimestamp('log', `Found video note attachment`);
+    }
+    
+    // Stickers
+    if (msg.sticker) {
+        const isAnimated = msg.sticker.is_animated;
+        const isVideo = msg.sticker.is_video;
+        files.push({
+            fileId: msg.sticker.file_id,
+            fileName: isVideo ? 'sticker.webm' : (isAnimated ? 'sticker.tgs' : 'sticker.webp'),
+            mimeType: isVideo ? 'video/webm' : (isAnimated ? 'application/x-tgsticker' : 'image/webp')
+        });
+        logWithTimestamp('log', `Found sticker attachment`);
+    }
+    
+    return files;
 }
 
 /**

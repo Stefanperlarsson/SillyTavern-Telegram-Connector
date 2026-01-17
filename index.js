@@ -23,6 +23,11 @@ import {
     setExternalAbortController,
 } from "../../../../script.js";
 
+// Import utility functions for file handling
+import {
+    saveBase64AsFile,
+} from "../../../../utils.js";
+
 // ============================================================================
 // CONSTANTS & CONFIGURATION
 // ============================================================================
@@ -192,6 +197,159 @@ function scanMessagesForMedia(startIndex, endIndex) {
     
     log('log', `scanMessagesForMedia: returning ${mediaItems.length} items`);
     return mediaItems;
+}
+
+/**
+ * @typedef {Object} UploadedFile
+ * @property {string} url - URL path to the uploaded file
+ * @property {string} type - 'image' | 'video' | 'audio' | 'file'
+ * @property {string} fileName - Original file name
+ * @property {string} mimeType - MIME type
+ */
+
+/**
+ * Processes file attachments from Telegram and uploads them to SillyTavern
+ * @param {Array<{base64: string, mimeType: string, fileName: string}>} files - Files from Telegram
+ * @returns {Promise<UploadedFile[]>} Array of uploaded file info
+ */
+async function processFileAttachments(files) {
+    const uploaded = [];
+    
+    log('log', `Processing ${files.length} file attachment(s) from Telegram`);
+    
+    for (const file of files) {
+        try {
+            log('log', `Uploading file: ${file.fileName} (${file.mimeType}), base64 length: ${file.base64.length}`);
+            
+            // Determine file type category
+            const isImage = file.mimeType.startsWith('image/');
+            const isVideo = file.mimeType.startsWith('video/');
+            const isAudio = file.mimeType.startsWith('audio/');
+            
+            // Get file extension from filename or mime type
+            let ext = file.fileName.includes('.') 
+                ? file.fileName.split('.').pop() 
+                : null;
+            
+            // Fallback extension from mime type
+            if (!ext) {
+                const mimeExtMap = {
+                    'image/jpeg': 'jpg',
+                    'image/png': 'png',
+                    'image/gif': 'gif',
+                    'image/webp': 'webp',
+                    'video/mp4': 'mp4',
+                    'video/webm': 'webm',
+                    'audio/mpeg': 'mp3',
+                    'audio/ogg': 'ogg',
+                    'audio/wav': 'wav',
+                };
+                ext = mimeExtMap[file.mimeType] || 'bin';
+            }
+            
+            log('log', `File type: ${isImage ? 'image' : isVideo ? 'video' : isAudio ? 'audio' : 'file'}, extension: ${ext}`);
+            
+            // Upload to SillyTavern server using saveBase64AsFile
+            // Parameters: (base64Data, uniqueId, prefix, extension)
+            const context = SillyTavern.getContext();
+            const userName = context.name1 || 'user';
+            const url = await saveBase64AsFile(file.base64, userName, 'telegram', ext);
+            
+            log('log', `File uploaded successfully: ${url}`);
+            
+            uploaded.push({
+                url: url,
+                type: isImage ? 'image' : isVideo ? 'video' : isAudio ? 'audio' : 'file',
+                fileName: file.fileName,
+                mimeType: file.mimeType,
+            });
+        } catch (error) {
+            log('error', `Failed to upload file ${file.fileName}: ${error.message}`);
+        }
+    }
+    
+    log('log', `Successfully uploaded ${uploaded.length}/${files.length} files`);
+    return uploaded;
+}
+
+/**
+ * Builds the extra object for a user message with file attachments
+ * @param {UploadedFile[]} uploadedFiles - Array of uploaded file info
+ * @returns {Object} Extra object to merge into message
+ */
+function buildFileExtras(uploadedFiles) {
+    const extras = {};
+    
+    // Separate files by type
+    const images = uploadedFiles.filter(f => f.type === 'image');
+    const videos = uploadedFiles.filter(f => f.type === 'video');
+    const audios = uploadedFiles.filter(f => f.type === 'audio');
+    const otherFiles = uploadedFiles.filter(f => f.type === 'file');
+    
+    log('log', `Building extras: ${images.length} images, ${videos.length} videos, ${audios.length} audio, ${otherFiles.length} other`);
+    
+    // For images - ST can handle single image via extra.image or multiple via extra.media
+    if (images.length === 1) {
+        extras.image = images[0].url;
+        extras.inline_image = true;
+        log('log', `Set single image: ${images[0].url}`);
+    } else if (images.length > 1) {
+        // Use media array for multiple images
+        extras.media = images.map(img => ({
+            url: img.url,
+            type: 'image',
+            title: '',
+        }));
+        log('log', `Set ${images.length} images via media array`);
+    }
+    
+    // For single video
+    if (videos.length === 1) {
+        extras.video = videos[0].url;
+        log('log', `Set single video: ${videos[0].url}`);
+    } else if (videos.length > 1) {
+        // Add videos to media array
+        const videoMedia = videos.map(v => ({
+            url: v.url,
+            type: 'video',
+            title: '',
+        }));
+        extras.media = (extras.media || []).concat(videoMedia);
+        log('log', `Added ${videos.length} videos to media array`);
+    }
+    
+    // For audio files - add to media array
+    if (audios.length > 0) {
+        const audioMedia = audios.map(a => ({
+            url: a.url,
+            type: 'audio',
+            title: '',
+        }));
+        extras.media = (extras.media || []).concat(audioMedia);
+        log('log', `Added ${audios.length} audio files to media array`);
+    }
+    
+    // For other files - ST uses extra.file for single file attachment
+    if (otherFiles.length === 1) {
+        extras.file = {
+            url: otherFiles[0].url,
+            name: otherFiles[0].fileName,
+            size: 0, // We don't have the exact size, but ST may not require it
+        };
+        log('log', `Set single file attachment: ${otherFiles[0].fileName}`);
+    } else if (otherFiles.length > 1) {
+        // For multiple files, we might need a different approach
+        // For now, only attach the first one and log a warning
+        extras.file = {
+            url: otherFiles[0].url,
+            name: otherFiles[0].fileName,
+            size: 0,
+        };
+        log('warn', `Multiple non-media files received, only attaching the first: ${otherFiles[0].fileName}`);
+    }
+    
+    log('log', `Built extras object:`, JSON.stringify(extras, null, 2));
+    return extras;
 }
 
 // ============================================================================
@@ -569,13 +727,14 @@ async function handleExecuteCommand(data) {
  */
 async function handleUserMessage(data) {
     log('log', 'Received user message for generation', data);
+    log('log', `Message has ${data.files?.length || 0} file attachment(s)`);
 
     const chatId = data.chatId;
     const botId = data.botId;
     const characterName = data.characterName;
 
     // Get current chat length to track new messages
-    const context = SillyTavern.getContext();
+    let context = SillyTavern.getContext();
     const startMessageIndex = context.chat.length;
 
     // Set up active request tracking
@@ -591,8 +750,47 @@ async function handleUserMessage(data) {
     // Send typing indicator
     sendToServer({ type: 'typing_action', chatId, botId });
 
+    // Process file attachments if present
+    let fileExtras = null;
+    if (data.files && data.files.length > 0) {
+        log('log', `Processing ${data.files.length} file attachment(s)...`);
+        const uploadedFiles = await processFileAttachments(data.files);
+        if (uploadedFiles.length > 0) {
+            fileExtras = buildFileExtras(uploadedFiles);
+        }
+    }
+
     // Add user message to SillyTavern
     await sendMessageAsUser(data.text);
+
+    // If we have file attachments, add them to the user message we just created
+    if (fileExtras) {
+        // Refresh context to get the updated chat
+        context = SillyTavern.getContext();
+        const userMessageIndex = context.chat.length - 1;
+        const userMessage = context.chat[userMessageIndex];
+        
+        if (userMessage && userMessage.is_user) {
+            log('log', `Attaching file extras to user message at index ${userMessageIndex}`);
+            
+            // Merge file extras into the message's extra object
+            userMessage.extra = userMessage.extra || {};
+            Object.assign(userMessage.extra, fileExtras);
+            
+            log('log', `User message extra after merge:`, JSON.stringify(userMessage.extra, null, 2));
+            
+            // Save the chat to persist the changes
+            try {
+                const { saveChatConditional } = await import("../../../../script.js");
+                await saveChatConditional();
+                log('log', `Chat saved with file attachments`);
+            } catch (saveError) {
+                log('error', `Failed to save chat: ${saveError.message}`);
+            }
+        } else {
+            log('warn', `Could not find user message to attach files. Index: ${userMessageIndex}, is_user: ${userMessage?.is_user}`);
+        }
+    }
 
     // Set up streaming callback
     const streamCallback = (cumulativeText) => {
