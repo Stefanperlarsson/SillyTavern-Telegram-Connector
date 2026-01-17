@@ -590,17 +590,45 @@ function handleFinalMessage(lastMessageIdInChatArray) {
 
         // === IMAGE SUPPORT DEBUG LOGGING ===
         log('log', '=== MESSAGE PAYLOAD DEBUG ===');
+        log('log', 'Current message index:', lastMessageIndex);
         log('log', 'lastMessage object:', JSON.stringify(lastMessage, null, 2));
-        log('log', 'lastMessage keys:', Object.keys(lastMessage || {}));
         
-        // Check for common image-related properties
-        if (lastMessage) {
-            log('log', 'lastMessage.mes (raw message):', lastMessage.mes);
-            log('log', 'lastMessage.extra:', JSON.stringify(lastMessage.extra, null, 2));
-            log('log', 'lastMessage.image:', lastMessage.image);
-            log('log', 'lastMessage.images:', lastMessage.images);
-            log('log', 'lastMessage.file:', lastMessage.file);
-            log('log', 'lastMessage.files:', lastMessage.files);
+        // Check for media attachments (images stored in extra.media array)
+        if (lastMessage?.extra?.media?.length > 0) {
+            log('log', '*** FOUND MEDIA IN CURRENT MESSAGE ***');
+            log('log', 'Media count:', lastMessage.extra.media.length);
+            lastMessage.extra.media.forEach((media, idx) => {
+                log('log', `Media ${idx}:`, {
+                    type: media.type,
+                    source: media.source,
+                    title: media.title,
+                    urlPreview: media.url?.substring(0, 100) + '...',
+                    urlLength: media.url?.length
+                });
+            });
+        }
+        
+        // Scan recent messages to find any with images
+        log('log', '=== SCANNING RECENT MESSAGES FOR MEDIA ===');
+        const chatLength = context.chat.length;
+        const startIdx = Math.max(0, chatLength - 6);
+        for (let i = startIdx; i < chatLength; i++) {
+            const msg = context.chat[i];
+            const hasMedia = msg?.extra?.media?.length > 0;
+            log('log', `Message ${i}:`, {
+                is_user: msg?.is_user,
+                is_system: msg?.is_system,
+                name: msg?.name,
+                hasMedia: hasMedia,
+                mediaCount: msg?.extra?.media?.length || 0,
+                mesPreview: msg?.mes?.substring(0, 60) + (msg?.mes?.length > 60 ? '...' : '')
+            });
+            if (hasMedia) {
+                log('log', `  -> Media details for message ${i}:`);
+                msg.extra.media.forEach((media, idx) => {
+                    log('log', `     Media ${idx}: type=${media.type}, source=${media.source}, urlLen=${media.url?.length}`);
+                });
+            }
         }
         // === END DEBUG LOGGING ===
 
@@ -610,22 +638,6 @@ function handleFinalMessage(lastMessageIdInChatArray) {
 
             if (messageElement.length > 0) {
                 const messageTextElement = messageElement.find('.mes_text');
-
-                // === IMAGE SUPPORT DEBUG: Check DOM for images ===
-                const imagesInMessage = messageElement.find('img');
-                log('log', `Found ${imagesInMessage.length} <img> elements in message DOM`);
-                imagesInMessage.each((index, img) => {
-                    log('log', `Image ${index}:`, {
-                        src: $(img).attr('src')?.substring(0, 100) + '...',
-                        class: $(img).attr('class'),
-                        alt: $(img).attr('alt'),
-                        'data-*': Object.keys(img.dataset || {})
-                    });
-                });
-                
-                // Log the raw HTML before processing
-                log('log', 'Raw HTML content:', messageTextElement.html()?.substring(0, 500));
-                // === END IMAGE DEBUG ===
 
                 // Get HTML content and convert to plain text
                 let renderedText = messageTextElement.html()
