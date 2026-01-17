@@ -575,12 +575,44 @@ function handleFinalMessage(lastMessageIdInChatArray) {
         const context = SillyTavern.getContext();
         const lastMessage = context.chat[lastMessageIndex];
 
+        // === IMAGE SUPPORT DEBUG LOGGING ===
+        log('log', '=== MESSAGE PAYLOAD DEBUG ===');
+        log('log', 'lastMessage object:', JSON.stringify(lastMessage, null, 2));
+        log('log', 'lastMessage keys:', Object.keys(lastMessage || {}));
+        
+        // Check for common image-related properties
+        if (lastMessage) {
+            log('log', 'lastMessage.mes (raw message):', lastMessage.mes);
+            log('log', 'lastMessage.extra:', JSON.stringify(lastMessage.extra, null, 2));
+            log('log', 'lastMessage.image:', lastMessage.image);
+            log('log', 'lastMessage.images:', lastMessage.images);
+            log('log', 'lastMessage.file:', lastMessage.file);
+            log('log', 'lastMessage.files:', lastMessage.files);
+        }
+        // === END DEBUG LOGGING ===
+
         // Confirm this is the AI reply we just triggered
         if (lastMessage && !lastMessage.is_user && !lastMessage.is_system) {
             const messageElement = $(`#chat .mes[mesid="${lastMessageIndex}"]`);
 
             if (messageElement.length > 0) {
                 const messageTextElement = messageElement.find('.mes_text');
+
+                // === IMAGE SUPPORT DEBUG: Check DOM for images ===
+                const imagesInMessage = messageElement.find('img');
+                log('log', `Found ${imagesInMessage.length} <img> elements in message DOM`);
+                imagesInMessage.each((index, img) => {
+                    log('log', `Image ${index}:`, {
+                        src: $(img).attr('src')?.substring(0, 100) + '...',
+                        class: $(img).attr('class'),
+                        alt: $(img).attr('alt'),
+                        'data-*': Object.keys(img.dataset || {})
+                    });
+                });
+                
+                // Log the raw HTML before processing
+                log('log', 'Raw HTML content:', messageTextElement.html()?.substring(0, 500));
+                // === END IMAGE DEBUG ===
 
                 // Get HTML content and convert to plain text
                 let renderedText = messageTextElement.html()
