@@ -673,6 +673,49 @@ function handleSystemCommand(command, chatId, managedBot) {
  */
 const ongoingStreams = new Map();
 
+// ============================================================================
+// IMAGE HANDLING
+// ============================================================================
+
+/**
+ * Sends images to a Telegram chat
+ * @param {ManagedBot} bot - The bot to send through
+ * @param {number} chatId - The chat ID to send to
+ * @param {Array<{base64: string, mimeType: string, caption?: string}>} images - Images to send
+ * @returns {Promise<void>}
+ */
+async function sendImagesToTelegram(bot, chatId, images) {
+    for (const image of images) {
+        try {
+            // Convert base64 to Buffer
+            const imageBuffer = Buffer.from(image.base64, 'base64');
+            
+            // Determine file extension from mime type
+            const extMap = {
+                'image/png': 'png',
+                'image/jpeg': 'jpg',
+                'image/jpg': 'jpg',
+                'image/gif': 'gif',
+                'image/webp': 'webp',
+            };
+            const ext = extMap[image.mimeType] || 'png';
+            
+            logWithTimestamp('log', `Sending image to Telegram: ${image.mimeType}, ${imageBuffer.length} bytes`);
+            
+            // Send the photo without caption (the prompt is not useful to show)
+            // Use fileOptions to specify content type and avoid deprecation warning
+            await bot.instance.sendPhoto(chatId, imageBuffer, {}, {
+                filename: `image.${ext}`,
+                contentType: image.mimeType,
+            });
+            
+            logWithTimestamp('log', `Image sent successfully`);
+        } catch (err) {
+            logWithTimestamp('error', `Failed to send image: ${err.message}`);
+        }
+    }
+}
+
 /**
  * Gets the stream key for a bot/chat combination
  * @param {string} botId - Bot identifier
@@ -832,6 +875,12 @@ wss.on('connection', ws => {
                     return;
                 }
 
+                // Send any images first (before the text message)
+                if (data.images && data.images.length > 0) {
+                    logWithTimestamp('log', `Sending ${data.images.length} image(s) to Telegram`);
+                    await sendImagesToTelegram(bot, data.chatId, data.images);
+                }
+
                 if (session) {
                     const messageId = await session.messagePromise;
                     if (messageId) {
@@ -864,6 +913,12 @@ wss.on('connection', ws => {
                 if (!bot) {
                     logWithTimestamp('error', `Received ai_reply for unknown bot: ${data.botId}`);
                     return;
+                }
+
+                // Send any images first (before the text message)
+                if (data.images && data.images.length > 0) {
+                    logWithTimestamp('log', `Sending ${data.images.length} image(s) to Telegram`);
+                    await sendImagesToTelegram(bot, data.chatId, data.images);
                 }
 
                 logWithTimestamp('log', `Sending non-streaming AI reply`);
