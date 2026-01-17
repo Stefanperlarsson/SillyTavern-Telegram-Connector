@@ -1,14 +1,71 @@
 // server.js
+// SillyTavern Telegram Bridge - Bot-per-Character Architecture
+// This server manages multiple Telegram bots, each representing a dedicated SillyTavern character.
+// All requests are serialized through a FIFO queue with mutex to prevent race conditions.
+
 const TelegramBot = require('node-telegram-bot-api');
 const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
 
-// Add logging function with timestamp
+// ============================================================================
+// TYPE DEFINITIONS (JSDoc)
+// ============================================================================
+
+/**
+ * @typedef {Object} BotConfig
+ * @property {string} token - Telegram Bot API token
+ * @property {string} characterName - Exact name of the SillyTavern character
+ */
+
+/**
+ * @typedef {Object} ManagedBot
+ * @property {string} id - Unique identifier (derived from token)
+ * @property {TelegramBot} instance - The node-telegram-bot-api instance
+ * @property {string} characterName - The character this bot represents
+ * @property {string} token - The bot's token (for restart notifications)
+ */
+
+/**
+ * @typedef {Object} QueueJob
+ * @property {string} id - Unique job identifier
+ * @property {ManagedBot} bot - The bot that received the message
+ * @property {number} chatId - Telegram chat ID
+ * @property {number} userId - Telegram user ID
+ * @property {string} text - Message text
+ * @property {string} targetCharacter - Character name to switch to
+ * @property {'message' | 'command'} type - Job type
+ * @property {string} [command] - Command name (if type is 'command')
+ * @property {string[]} [args] - Command arguments (if type is 'command')
+ * @property {number} timestamp - When the job was created
+ */
+
+/**
+ * @typedef {Object} StreamSession
+ * @property {Promise<number>} messagePromise - Promise resolving to the Telegram message ID
+ * @property {string} lastText - Last streamed text content
+ * @property {NodeJS.Timeout|null} timer - Throttle timer for edits
+ * @property {boolean} isEditing - Whether an edit is currently in progress
+ */
+
+/**
+ * @typedef {Object} ActiveJob
+ * @property {QueueJob} job - The currently processing job
+ * @property {boolean} characterSwitched - Whether the character switch is confirmed
+ * @property {AbortController} [abortController] - For cancelling generation
+ */
+
+// ============================================================================
+// LOGGING UTILITY
+// ============================================================================
+
+/**
+ * Logs a message with timestamp prefix
+ * @param {'log' | 'error' | 'warn'} level - Log level
+ * @param {...any} args - Arguments to log
+ */
 function logWithTimestamp(level, ...args) {
     const now = new Date();
-
-    // Format time using local timezone
     const year = now.getFullYear();
     const month = String(now.getMonth() + 1).padStart(2, '0');
     const day = String(now.getDate()).padStart(2, '0');
@@ -31,12 +88,18 @@ function logWithTimestamp(level, ...args) {
     }
 }
 
-// Restart protection - prevent restart loops
+// ============================================================================
+// RESTART PROTECTION
+// ============================================================================
+
 const RESTART_PROTECTION_FILE = path.join(__dirname, '.restart_protection');
 const MAX_RESTARTS = 3;
 const RESTART_WINDOW_MS = 60000; // 1 minute
 
-// Check if possibly in a restart loop
+/**
+ * Checks for restart loops and prevents resource exhaustion
+ * Exits the process if too many restarts are detected within the time window
+ */
 function checkRestartProtection() {
     try {
         if (fs.existsSync(RESTART_PROTECTION_FILE)) {
@@ -45,490 +108,650 @@ function checkRestartProtection() {
 
             // Clean up expired restart records
             data.restarts = data.restarts.filter(time => now - time < RESTART_WINDOW_MS);
-
-            // Add current restart time
             data.restarts.push(now);
 
-            // If too many restarts within time window, exit
             if (data.restarts.length > MAX_RESTARTS) {
                 logWithTimestamp('error', `Possible restart loop detected! Restarted ${data.restarts.length} times within ${RESTART_WINDOW_MS / 1000} seconds.`);
                 logWithTimestamp('error', 'Server will exit to prevent resource exhaustion. Please manually check and fix the issue before restarting.');
 
-                // If there's a notification chatId, try to send error message
-                if (process.env.RESTART_NOTIFY_CHATID) {
+                if (process.env.RESTART_NOTIFY_CHATID && process.env.RESTART_NOTIFY_BOT_TOKEN) {
                     const chatId = parseInt(process.env.RESTART_NOTIFY_CHATID);
                     if (!isNaN(chatId)) {
-                        // Create temporary bot to send error message
                         try {
-                            const tempBot = new TelegramBot(require('./config').telegramToken, { polling: false });
+                            const tempBot = new TelegramBot(process.env.RESTART_NOTIFY_BOT_TOKEN, { polling: false });
                             tempBot.sendMessage(chatId, 'Restart loop detected! Server has stopped to prevent resource exhaustion. Please check the issue manually.')
                                 .finally(() => process.exit(1));
                         } catch (e) {
                             process.exit(1);
                         }
-                        return; // Wait for message to send before exiting
+                        return;
                     }
                 }
-
                 process.exit(1);
             }
 
-            // Save updated restart records
             fs.writeFileSync(RESTART_PROTECTION_FILE, JSON.stringify(data));
         } else {
-            // Create new restart protection file
             fs.writeFileSync(RESTART_PROTECTION_FILE, JSON.stringify({ restarts: [Date.now()] }));
         }
     } catch (error) {
         logWithTimestamp('error', 'Restart protection check failed:', error);
-        // Continue on error, don't prevent server startup
     }
 }
 
-// Check restart protection on startup
 checkRestartProtection();
 
-// Check if configuration file exists
+// ============================================================================
+// CONFIGURATION LOADING
+// ============================================================================
+
 const configPath = path.join(__dirname, './config.js');
 if (!fs.existsSync(configPath)) {
     logWithTimestamp('error', 'Error: Configuration file config.js not found!');
-    logWithTimestamp('error', 'Please copy config.example.js to config.js in the server directory and set your Telegram Bot Token');
-    process.exit(1); // Terminate program
+    logWithTimestamp('error', 'Please copy config.example.js to config.js in the server directory and configure your bots');
+    process.exit(1);
 }
 
-const config = require('./config');
+let config = require('./config');
 
-// --- Configuration ---
-// Get Telegram Bot Token and WebSocket port from configuration file
-const token = config.telegramToken;
-// WebSocket server port
-const wssPort = config.wssPort;
+/**
+ * Validates the configuration file structure
+ * @param {Object} cfg - Configuration object to validate
+ * @returns {boolean} True if valid, exits process if invalid
+ */
+function validateConfig(cfg) {
+    if (!cfg.bots || !Array.isArray(cfg.bots) || cfg.bots.length === 0) {
+        logWithTimestamp('error', 'Error: No bots configured in config.js!');
+        logWithTimestamp('error', 'Please add at least one bot configuration to the "bots" array.');
+        return false;
+    }
 
-// Check if default token was modified
-if (token === 'TOKEN' || token === 'YOUR_TELEGRAM_BOT_TOKEN_HERE') {
-    logWithTimestamp('error', 'Error: Please set your Telegram Bot Token in config.js first!');
-    logWithTimestamp('error', 'Find the line telegramToken: \'YOUR_TELEGRAM_BOT_TOKEN_HERE\' and replace it with the token you got from BotFather');
-    process.exit(1); // Terminate program
+    for (let i = 0; i < cfg.bots.length; i++) {
+        const bot = cfg.bots[i];
+        if (!bot.token || bot.token === 'YOUR_FIRST_BOT_TOKEN_HERE' || bot.token === 'YOUR_SECOND_BOT_TOKEN_HERE') {
+            logWithTimestamp('error', `Error: Bot ${i + 1} has an invalid token. Please set a valid Telegram Bot Token.`);
+            return false;
+        }
+        if (!bot.characterName || bot.characterName === 'Character Name Here') {
+            logWithTimestamp('error', `Error: Bot ${i + 1} has no characterName configured.`);
+            return false;
+        }
+    }
+
+    return true;
 }
 
-// Initialize Telegram Bot, but don't start polling immediately
-const bot = new TelegramBot(token, { polling: false });
-logWithTimestamp('log', 'Initializing Telegram Bot...');
+if (!validateConfig(config)) {
+    process.exit(1);
+}
 
-// Manually clear all pending messages, then start polling
-(async function clearAndStartPolling() {
+const wssPort = config.wssPort || 2333;
+
+// ============================================================================
+// REQUEST QUEUE & MUTEX SYSTEM
+// ============================================================================
+
+/** @type {QueueJob[]} */
+const requestQueue = [];
+
+/** @type {ActiveJob|null} */
+let activeJob = null;
+
+/** @type {boolean} */
+let isProcessing = false;
+
+/**
+ * Generates a unique job ID
+ * @returns {string} Unique identifier
+ */
+function generateJobId() {
+    return `job_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+}
+
+/**
+ * Adds a job to the queue and triggers processing
+ * @param {QueueJob} job - The job to enqueue
+ */
+function enqueueJob(job) {
+    job.id = generateJobId();
+    job.timestamp = Date.now();
+    requestQueue.push(job);
+    logWithTimestamp('log', `Job ${job.id} enqueued for character "${job.targetCharacter}" (queue size: ${requestQueue.length})`);
+    processQueue();
+}
+
+/**
+ * Processes the next job in the queue if not already processing
+ * Implements the mutex lock pattern
+ */
+async function processQueue() {
+    // Mutex check - if already processing, exit
+    if (isProcessing) {
+        return;
+    }
+
+    // Check if there are jobs to process
+    if (requestQueue.length === 0) {
+        return;
+    }
+
+    // Check if SillyTavern is connected
+    if (!sillyTavernClient || sillyTavernClient.readyState !== WebSocket.OPEN) {
+        logWithTimestamp('warn', 'Cannot process queue: SillyTavern not connected');
+        // Notify all queued users
+        for (const job of requestQueue) {
+            job.bot.instance.sendMessage(job.chatId, 'Sorry, I cannot connect to SillyTavern right now. Please ensure SillyTavern is open and the Telegram extension is enabled.')
+                .catch(err => logWithTimestamp('error', 'Failed to send not-connected message:', err.message));
+        }
+        requestQueue.length = 0; // Clear queue
+        return;
+    }
+
+    // Acquire lock
+    isProcessing = true;
+
+    // Dequeue the next job
+    const job = requestQueue.shift();
+    activeJob = {
+        job: job,
+        characterSwitched: false
+    };
+
+    logWithTimestamp('log', `Processing job ${job.id} for bot "${job.targetCharacter}"`);
+
     try {
-        logWithTimestamp('log', 'Clearing Telegram message queue...');
+        // Step 1: Switch character (and wait for confirmation)
+        await switchCharacterAndWait(job);
 
-        // Check if this is a restart, if so use more thorough clearing
-        const isRestart = process.env.TELEGRAM_CLEAR_UPDATES === '1';
-        if (isRestart) {
-            logWithTimestamp('log', 'Restart marker detected, performing thorough message queue cleanup...');
-            // Get updates and discard all messages
-            let updates;
-            let lastUpdateId = 0;
+        // Step 2: If character switch succeeded, process the actual request
+        if (activeJob && activeJob.characterSwitched) {
+            if (job.type === 'message') {
+                await sendUserMessage(job);
+            } else if (job.type === 'command') {
+                await executeCommand(job);
+            }
+        }
+    } catch (error) {
+        logWithTimestamp('error', `Error processing job ${job.id}:`, error);
+        job.bot.instance.sendMessage(job.chatId, `An error occurred: ${error.message}`)
+            .catch(err => logWithTimestamp('error', 'Failed to send error message:', err.message));
+        releaseJob();
+    }
+}
 
-            // Loop to get all updates until no more updates
-            do {
-                updates = await bot.getUpdates({
-                    offset: lastUpdateId,
-                    limit: 100,
-                    timeout: 0
-                });
+/**
+ * Sends the switchchar command and waits for confirmation from the extension
+ * @param {QueueJob} job - The current job
+ * @returns {Promise<void>}
+ */
+function switchCharacterAndWait(job) {
+    return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+            reject(new Error('Character switch timed out after 30 seconds'));
+        }, 30000);
 
-                if (updates && updates.length > 0) {
-                    lastUpdateId = updates[updates.length - 1].update_id + 1;
-                    logWithTimestamp('log', `Cleared ${updates.length} messages, current offset: ${lastUpdateId}`);
-                }
-            } while (updates && updates.length > 0);
+        // Store the resolve/reject handlers on the active job for the WebSocket handler to use
+        activeJob.switchResolve = () => {
+            clearTimeout(timeout);
+            activeJob.characterSwitched = true;
+            resolve();
+        };
+        activeJob.switchReject = (error) => {
+            clearTimeout(timeout);
+            reject(error);
+        };
 
-            // Clear environment variable
-            delete process.env.TELEGRAM_CLEAR_UPDATES;
-            logWithTimestamp('log', 'Message queue cleanup complete');
-        } else {
-            // Normal startup cleanup
-            const updates = await bot.getUpdates({ limit: 100, timeout: 0 });
-            if (updates && updates.length > 0) {
-                // If there are updates, get the last update ID and set offset to it+1
-                const lastUpdateId = updates[updates.length - 1].update_id;
-                await bot.getUpdates({ offset: lastUpdateId + 1, limit: 1, timeout: 0 });
-                logWithTimestamp('log', `Cleared ${updates.length} pending messages`);
+        // Send switch character command to SillyTavern
+        logWithTimestamp('log', `Requesting character switch to "${job.targetCharacter}"`);
+        sillyTavernClient.send(JSON.stringify({
+            type: 'execute_command',
+            command: 'switchchar',
+            args: [job.targetCharacter],
+            chatId: job.chatId,
+            botId: job.bot.id,
+            isQueuedSwitch: true // Flag to indicate this is part of queue processing
+        }));
+    });
+}
+
+/**
+ * Sends the user message to SillyTavern for generation
+ * @param {QueueJob} job - The current job
+ */
+async function sendUserMessage(job) {
+    logWithTimestamp('log', `Sending user message to SillyTavern for job ${job.id}`);
+
+    // Send typing indicator
+    job.bot.instance.sendChatAction(job.chatId, 'typing')
+        .catch(err => logWithTimestamp('error', 'Failed to send typing action:', err.message));
+
+    // Send the message to SillyTavern
+    sillyTavernClient.send(JSON.stringify({
+        type: 'user_message',
+        chatId: job.chatId,
+        text: job.text,
+        botId: job.bot.id,
+        characterName: job.targetCharacter
+    }));
+}
+
+/**
+ * Executes a command for the current job
+ * @param {QueueJob} job - The current job
+ */
+async function executeCommand(job) {
+    logWithTimestamp('log', `Executing command /${job.command} for job ${job.id}`);
+
+    // Send typing indicator
+    job.bot.instance.sendChatAction(job.chatId, 'typing')
+        .catch(err => logWithTimestamp('error', 'Failed to send typing action:', err.message));
+
+    // Send the command to SillyTavern
+    sillyTavernClient.send(JSON.stringify({
+        type: 'execute_command',
+        command: job.command,
+        args: job.args || [],
+        chatId: job.chatId,
+        botId: job.bot.id,
+        characterName: job.targetCharacter
+    }));
+}
+
+/**
+ * Releases the current job and processes the next one in queue
+ * Called when a job completes (success or failure)
+ */
+function releaseJob() {
+    if (activeJob) {
+        logWithTimestamp('log', `Releasing job ${activeJob.job.id}`);
+    }
+    activeJob = null;
+    isProcessing = false;
+
+    // Process next job in queue
+    setImmediate(processQueue);
+}
+
+/**
+ * Handles disconnection mid-generation by notifying the user and releasing the lock
+ */
+function handleDisconnectDuringProcessing() {
+    if (activeJob) {
+        const job = activeJob.job;
+        job.bot.instance.sendMessage(job.chatId, 'Connection to SillyTavern was lost during processing. Please try again.')
+            .catch(err => logWithTimestamp('error', 'Failed to send disconnect message:', err.message));
+
+        // Reject any pending switch
+        if (activeJob.switchReject) {
+            activeJob.switchReject(new Error('SillyTavern disconnected'));
+        }
+    }
+
+    // Clear all pending jobs
+    for (const job of requestQueue) {
+        job.bot.instance.sendMessage(job.chatId, 'Connection to SillyTavern was lost. Please try again later.')
+            .catch(err => logWithTimestamp('error', 'Failed to send queue-clear message:', err.message));
+    }
+    requestQueue.length = 0;
+
+    // Release lock
+    activeJob = null;
+    isProcessing = false;
+}
+
+// ============================================================================
+// BOT MANAGER
+// ============================================================================
+
+/** @type {Map<string, ManagedBot>} */
+const managedBots = new Map();
+
+/**
+ * Derives a unique bot ID from the token
+ * @param {string} token - Bot token
+ * @returns {string} Bot ID
+ */
+function getBotIdFromToken(token) {
+    // Use the first part of the token (bot user ID) as identifier
+    return token.split(':')[0];
+}
+
+/**
+ * Initializes all bots from config
+ * @returns {Promise<void>}
+ */
+async function initializeBots() {
+    logWithTimestamp('log', `Initializing ${config.bots.length} bot(s)...`);
+
+    for (const botConfig of config.bots) {
+        const botId = getBotIdFromToken(botConfig.token);
+
+        const bot = new TelegramBot(botConfig.token, { polling: false });
+
+        /** @type {ManagedBot} */
+        const managedBot = {
+            id: botId,
+            instance: bot,
+            characterName: botConfig.characterName,
+            token: botConfig.token
+        };
+
+        managedBots.set(botId, managedBot);
+
+        // Set up message handler for this bot
+        setupBotHandlers(managedBot);
+
+        logWithTimestamp('log', `Bot "${botConfig.characterName}" (ID: ${botId}) initialized`);
+    }
+
+    // Clear pending messages and start polling for all bots
+    await clearAndStartPollingAll();
+}
+
+/**
+ * Clears pending messages and starts polling for all bots
+ * @returns {Promise<void>}
+ */
+async function clearAndStartPollingAll() {
+    const isRestart = process.env.TELEGRAM_CLEAR_UPDATES === '1';
+
+    for (const [botId, managedBot] of managedBots) {
+        try {
+            logWithTimestamp('log', `Clearing message queue for bot "${managedBot.characterName}"...`);
+
+            if (isRestart) {
+                let updates;
+                let lastUpdateId = 0;
+
+                do {
+                    updates = await managedBot.instance.getUpdates({
+                        offset: lastUpdateId,
+                        limit: 100,
+                        timeout: 0
+                    });
+
+                    if (updates && updates.length > 0) {
+                        lastUpdateId = updates[updates.length - 1].update_id + 1;
+                    }
+                } while (updates && updates.length > 0);
             } else {
-                logWithTimestamp('log', 'No pending messages to clear');
+                const updates = await managedBot.instance.getUpdates({ limit: 100, timeout: 0 });
+                if (updates && updates.length > 0) {
+                    const lastUpdateId = updates[updates.length - 1].update_id;
+                    await managedBot.instance.getUpdates({ offset: lastUpdateId + 1, limit: 1, timeout: 0 });
+                    logWithTimestamp('log', `Cleared ${updates.length} pending messages for bot "${managedBot.characterName}"`);
+                }
+            }
+
+            // Start polling
+            managedBot.instance.startPolling({ restart: true, clean: true });
+            logWithTimestamp('log', `Bot "${managedBot.characterName}" polling started`);
+
+        } catch (error) {
+            logWithTimestamp('error', `Error starting bot "${managedBot.characterName}":`, error);
+            managedBot.instance.startPolling({ restart: true, clean: true });
+        }
+    }
+
+    if (isRestart) {
+        delete process.env.TELEGRAM_CLEAR_UPDATES;
+    }
+}
+
+/**
+ * Sets up message and command handlers for a bot
+ * @param {ManagedBot} managedBot - The managed bot instance
+ */
+function setupBotHandlers(managedBot) {
+    managedBot.instance.on('message', (msg) => {
+        const chatId = msg.chat.id;
+        const text = msg.text;
+        const userId = msg.from.id;
+        const username = msg.from.username || 'N/A';
+
+        // Check whitelist
+        if (config.allowedUserIds && config.allowedUserIds.length > 0) {
+            if (!config.allowedUserIds.includes(userId)) {
+                logWithTimestamp('log', `Rejected access from non-whitelisted user (Bot: ${managedBot.characterName}):\n  - User ID: ${userId}\n  - Username: @${username}`);
+                managedBot.instance.sendMessage(chatId, 'Sorry, you are not authorized to use this bot.')
+                    .catch(err => logWithTimestamp('error', 'Failed to send rejection message:', err.message));
+                return;
             }
         }
 
-        // Start polling
-        bot.startPolling({
-            restart: true,
-            clean: true
-        });
-        logWithTimestamp('log', 'Telegram Bot polling started');
-    } catch (error) {
-        logWithTimestamp('error', 'Error clearing message queue or starting polling:', error);
-        // If clearing fails, still try to start polling
-        bot.startPolling({ restart: true, clean: true });
-        logWithTimestamp('log', 'Telegram Bot polling started (after queue clearing failure)');
-    }
-})();
+        if (!text) return;
 
-// Initialize WebSocket server
-const wss = new WebSocket.Server({ port: wssPort });
-logWithTimestamp('log', `WebSocket server listening on port ${wssPort}...`);
-
-let sillyTavernClient = null; // Store connected SillyTavern extension client
-
-// Store ongoing streaming sessions, adjust session structure to use Promise for messageId
-// Structure: { messagePromise: Promise<number> | null, lastText: String, timer: NodeJS.Timeout | null, isEditing: boolean }
-const ongoingStreams = new Map();
-
-// Reload server function
-function reloadServer(chatId) {
-    logWithTimestamp('log', 'Reloading server-side component...');
-    Object.keys(require.cache).forEach(function (key) {
-        if (key.indexOf('node_modules') === -1) {
-            delete require.cache[key];
+        // Handle commands
+        if (text.startsWith('/')) {
+            handleBotCommand(managedBot, msg);
+            return;
         }
+
+        // Handle regular messages - enqueue for processing
+        /** @type {QueueJob} */
+        const job = {
+            id: '', // Will be set by enqueueJob
+            bot: managedBot,
+            chatId: chatId,
+            userId: userId,
+            text: text,
+            targetCharacter: managedBot.characterName,
+            type: 'message',
+            timestamp: 0 // Will be set by enqueueJob
+        };
+
+        logWithTimestamp('log', `Received message for "${managedBot.characterName}" from user ${userId}: "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`);
+        enqueueJob(job);
     });
-    try {
-        delete require.cache[require.resolve('./config.js')];
-        const newConfig = require('./config.js');
-        Object.assign(config, newConfig);
-        logWithTimestamp('log', 'Configuration file reloaded');
-    } catch (error) {
-        logWithTimestamp('error', 'Error reloading configuration file:', error);
-        if (chatId) bot.sendMessage(chatId, 'Error reloading configuration file: ' + error.message);
+}
+
+/**
+ * Handles bot commands (both system and character-specific)
+ * @param {ManagedBot} managedBot - The bot that received the command
+ * @param {Object} msg - Telegram message object
+ */
+function handleBotCommand(managedBot, msg) {
+    const chatId = msg.chat.id;
+    const text = msg.text;
+
+    const parts = text.slice(1).trim().split(/\s+/);
+    const command = parts[0].toLowerCase();
+    const args = parts.slice(1);
+
+    logWithTimestamp('log', `Command received on bot "${managedBot.characterName}": /${command}`);
+
+    // System commands handled directly
+    if (['reload', 'restart', 'exit', 'ping'].includes(command)) {
+        handleSystemCommand(command, chatId, managedBot);
         return;
     }
-    logWithTimestamp('log', 'Server-side component reloaded');
-    if (chatId) bot.sendMessage(chatId, 'Server-side component successfully reloaded.');
-}
 
-// Restart server function
-function restartServer(chatId) {
-    logWithTimestamp('log', 'Restarting server-side component...');
+    // Help command
+    if (command === 'help') {
+        const helpText = `${managedBot.characterName} - Telegram Bridge Commands:
 
-    // First stop Telegram Bot polling
-    bot.stopPolling().then(() => {
-        logWithTimestamp('log', 'Telegram Bot polling stopped');
+Chat Management
+/new - Start a new chat with ${managedBot.characterName}
+/listchats - List all saved chat logs for ${managedBot.characterName}
+/switchchat <name> - Load a specific chat log
+/switchchat_<N> - Load chat log by number
 
-        // Then close WebSocket server
-        if (wss) {
-            wss.close(() => {
-                logWithTimestamp('log', 'WebSocket server closed, preparing to restart...');
-                setTimeout(() => {
-                    const { spawn } = require('child_process');
-                    const serverPath = path.join(__dirname, 'server.js');
-                    logWithTimestamp('log', `Restarting server: ${serverPath}`);
-                    const cleanEnv = {
-                        PATH: process.env.PATH,
-                        NODE_PATH: process.env.NODE_PATH,
-                        TELEGRAM_CLEAR_UPDATES: '1' // Add marker to indicate this is a restart
-                    };
-                    if (chatId) cleanEnv.RESTART_NOTIFY_CHATID = chatId.toString();
-                    const child = spawn(process.execPath, [serverPath], { detached: true, stdio: 'inherit', env: cleanEnv });
-                    child.unref();
-                    process.exit(0);
-                }, 1000);
-            });
-        } else {
-            // If no WebSocket server, restart directly
-            setTimeout(() => {
-                const { spawn } = require('child_process');
-                const serverPath = path.join(__dirname, 'server.js');
-                logWithTimestamp('log', `Restarting server: ${serverPath}`);
-                const cleanEnv = {
-                    PATH: process.env.PATH,
-                    NODE_PATH: process.env.NODE_PATH,
-                    TELEGRAM_CLEAR_UPDATES: '1' // Add marker to indicate this is a restart
-                };
-                if (chatId) cleanEnv.RESTART_NOTIFY_CHATID = chatId.toString();
-                const child = spawn(process.execPath, [serverPath], { detached: true, stdio: 'inherit', env: cleanEnv });
-                child.unref();
-                process.exit(0);
-            }, 1000);
-        }
-    }).catch(err => {
-        logWithTimestamp('error', 'Error stopping Telegram Bot polling:', err);
-        // Continue restart process even on error
-        if (wss) {
-            wss.close(() => {
-                // Restart code...
-                setTimeout(() => {
-                    const { spawn } = require('child_process');
-                    const serverPath = path.join(__dirname, 'server.js');
-                    logWithTimestamp('log', `Restarting server: ${serverPath}`);
-                    const cleanEnv = {
-                        PATH: process.env.PATH,
-                        NODE_PATH: process.env.NODE_PATH,
-                        TELEGRAM_CLEAR_UPDATES: '1' // Add marker to indicate this is a restart
-                    };
-                    if (chatId) cleanEnv.RESTART_NOTIFY_CHATID = chatId.toString();
-                    const child = spawn(process.execPath, [serverPath], { detached: true, stdio: 'inherit', env: cleanEnv });
-                    child.unref();
-                    process.exit(0);
-                }, 1000);
-            });
-        } else {
-            // If no WebSocket server, restart directly
-            setTimeout(() => {
-                const { spawn } = require('child_process');
-                const serverPath = path.join(__dirname, 'server.js');
-                logWithTimestamp('log', `Restarting server: ${serverPath}`);
-                const cleanEnv = {
-                    PATH: process.env.PATH,
-                    NODE_PATH: process.env.NODE_PATH,
-                    TELEGRAM_CLEAR_UPDATES: '1' // Add marker to indicate this is a restart
-                };
-                if (chatId) cleanEnv.RESTART_NOTIFY_CHATID = chatId.toString();
-                const child = spawn(process.execPath, [serverPath], { detached: true, stdio: 'inherit', env: cleanEnv });
-                child.unref();
-                process.exit(0);
-            }, 1000);
-        }
-    });
-}
+System Management
+/reload - Reload server configuration
+/restart - Restart server
+/exit - Shutdown server
+/ping - Check connection status
 
-// Exit server function
-function exitServer() {
-    logWithTimestamp('log', 'Shutting down server...');
-    const forceExitTimeout = setTimeout(() => {
-        logWithTimestamp('error', 'Exit operation timeout, forcing process exit');
-        process.exit(1);
-    }, 10000);
-    try {
-        if (fs.existsSync(RESTART_PROTECTION_FILE)) {
-            fs.unlinkSync(RESTART_PROTECTION_FILE);
-            logWithTimestamp('log', 'Restart protection file cleaned up');
-        }
-    } catch (error) {
-        logWithTimestamp('error', 'Failed to clean up restart protection file:', error);
+Help
+/help - Show this help message
+
+Note: This bot is dedicated to ${managedBot.characterName}. Messages you send will be processed as conversations with this character.`;
+
+        managedBot.instance.sendMessage(chatId, helpText)
+            .catch(err => logWithTimestamp('error', 'Failed to send help message:', err.message));
+        return;
     }
-    const finalExit = () => {
-        clearTimeout(forceExitTimeout);
-        logWithTimestamp('log', 'Server-side component successfully shut down');
-        process.exit(0);
-    };
-    if (wss) {
-        wss.close(() => {
-            logWithTimestamp('log', 'WebSocket server closed');
-            bot.stopPolling().finally(finalExit);
-        });
-    } else {
-        bot.stopPolling().finally(finalExit);
+
+    // Commands that need queueing (they interact with SillyTavern)
+    if (['new', 'listchats'].includes(command) || command.match(/^switchchat_?\d*$/)) {
+        /** @type {QueueJob} */
+        const job = {
+            id: '',
+            bot: managedBot,
+            chatId: chatId,
+            userId: msg.from.id,
+            text: '',
+            targetCharacter: managedBot.characterName,
+            type: 'command',
+            command: command,
+            args: args,
+            timestamp: 0
+        };
+
+        enqueueJob(job);
+        return;
     }
+
+    // Unknown command
+    managedBot.instance.sendMessage(chatId, `Unknown command: /${command}. Use /help to see available commands.`)
+        .catch(err => logWithTimestamp('error', 'Failed to send unknown command message:', err.message));
 }
 
-function handleSystemCommand(command, chatId) {
+/**
+ * Handles system commands that don't need queueing
+ * @param {string} command - The command name
+ * @param {number} chatId - Telegram chat ID
+ * @param {ManagedBot} managedBot - The bot that received the command
+ */
+function handleSystemCommand(command, chatId, managedBot) {
     logWithTimestamp('log', `Executing system command: ${command}`);
 
-    // Handle ping command - return connection status information
     if (command === 'ping') {
-        const bridgeStatus = 'Bridge status: Connected ✅';
+        const bridgeStatus = 'Bridge status: Connected';
         const stStatus = sillyTavernClient && sillyTavernClient.readyState === WebSocket.OPEN ?
-            'SillyTavern status: Connected ✅' :
-            'SillyTavern status: Not connected ❌';
-        bot.sendMessage(chatId, `${bridgeStatus}\n${stStatus}`);
+            'SillyTavern status: Connected' :
+            'SillyTavern status: Not connected';
+        const queueStatus = `Queue: ${requestQueue.length} pending, ${isProcessing ? 'processing' : 'idle'}`;
+        const botsStatus = `Active bots: ${managedBots.size}`;
+
+        managedBot.instance.sendMessage(chatId, `${bridgeStatus}\n${stStatus}\n${queueStatus}\n${botsStatus}`)
+            .catch(err => logWithTimestamp('error', 'Failed to send ping response:', err.message));
         return;
     }
 
     let responseMessage = '';
     switch (command) {
         case 'reload':
-            responseMessage = 'Reloading server-side component...';
-            // If SillyTavern is connected, refresh UI
-            if (sillyTavernClient && sillyTavernClient.readyState === WebSocket.OPEN) {
-                sillyTavernClient.commandToExecuteOnClose = { command, chatId };
-                sillyTavernClient.send(JSON.stringify({ type: 'system_command', command: 'reload_ui_only', chatId }));
-            } else {
-                // If not connected, reload server directly
-                bot.sendMessage(chatId, responseMessage);
-                reloadServer(chatId);
-            }
+            responseMessage = 'Reloading server configuration...';
+            managedBot.instance.sendMessage(chatId, responseMessage)
+                .then(() => reloadServer(chatId, managedBot))
+                .catch(err => logWithTimestamp('error', 'Failed to send reload message:', err.message));
             break;
         case 'restart':
-            responseMessage = 'Restarting server-side component...';
-            // If SillyTavern is connected, refresh UI
-            if (sillyTavernClient && sillyTavernClient.readyState === WebSocket.OPEN) {
-                sillyTavernClient.commandToExecuteOnClose = { command, chatId };
-                sillyTavernClient.send(JSON.stringify({ type: 'system_command', command: 'reload_ui_only', chatId }));
-            } else {
-                // If not connected, restart server directly
-                bot.sendMessage(chatId, responseMessage);
-                restartServer(chatId);
-            }
+            responseMessage = 'Restarting server...';
+            managedBot.instance.sendMessage(chatId, responseMessage)
+                .then(() => restartServer(chatId, managedBot))
+                .catch(err => logWithTimestamp('error', 'Failed to send restart message:', err.message));
             break;
         case 'exit':
-            responseMessage = 'Shutting down server-side component...';
-            // If SillyTavern is connected, refresh UI
-            if (sillyTavernClient && sillyTavernClient.readyState === WebSocket.OPEN) {
-                sillyTavernClient.commandToExecuteOnClose = { command, chatId };
-                sillyTavernClient.send(JSON.stringify({ type: 'system_command', command: 'reload_ui_only', chatId }));
-            } else {
-                // If not connected, exit server directly
-                bot.sendMessage(chatId, responseMessage);
-                exitServer();
-            }
+            responseMessage = 'Shutting down server...';
+            managedBot.instance.sendMessage(chatId, responseMessage)
+                .then(() => exitServer())
+                .catch(err => logWithTimestamp('error', 'Failed to send exit message:', err.message));
             break;
-        default:
-            logWithTimestamp('warn', `Unknown system command: ${command}`);
-            bot.sendMessage(chatId, `Unknown system command: /${command}`);
-            return;
-    }
-
-    // Only send response message if SillyTavern is connected
-    // Messages are only sent in the above switch statement when SillyTavern is connected
-    if (sillyTavernClient && sillyTavernClient.readyState === WebSocket.OPEN) {
-        bot.sendMessage(chatId, responseMessage);
     }
 }
 
-// Handle Telegram commands
-async function handleTelegramCommand(command, args, chatId) {
-    logWithTimestamp('log', `Handling Telegram command: /${command} ${args.join(' ')}`);
+// ============================================================================
+// STREAMING SESSION MANAGEMENT
+// ============================================================================
 
-    // Show "typing" status
-    bot.sendChatAction(chatId, 'typing').catch(error =>
-        logWithTimestamp('error', 'Failed to send "typing" status:', error));
+/**
+ * Map of ongoing streaming sessions
+ * Key format: `${botId}_${chatId}` to ensure uniqueness across bots
+ * @type {Map<string, StreamSession>}
+ */
+const ongoingStreams = new Map();
 
-    // Default reply
-    let replyText = `Unknown command: /${command}. Use /help to see all commands.`;
-
-    // Special handling for help command, can be shown regardless of SillyTavern connection
-    if (command === 'help') {
-        replyText = `SillyTavern Telegram Bridge Commands:\n\n`;
-        replyText += `Chat Management\n`;
-        replyText += `/new - Start a new chat with the current character.\n`;
-        replyText += `/listchats - List all saved chat logs for the current character.\n`;
-        replyText += `/switchchat <chat_name> - Load a specific chat log.\n`;
-        replyText += `/switchchat_<number> - Load chat log by number.\n\n`;
-        replyText += `Character Management\n`;
-        replyText += `/listchars - List all available characters.\n`;
-        replyText += `/switchchar <char_name> - Switch to specified character.\n`;
-        replyText += `/switchchar_<number> - Switch character by number.\n\n`;
-        replyText += `System Management\n`;
-        replyText += `/reload - Reload plugin's server-side component and refresh ST webpage.\n`;
-        replyText += `/restart - Refresh ST webpage and restart plugin's server-side component.\n`;
-        replyText += `/exit - Exit plugin's server-side component.\n`;
-        replyText += `/ping - Check connection status.\n\n`;
-        replyText += `Help\n`;
-        replyText += `/help - Show this help message.`;
-
-        // Send help message and return
-        bot.sendMessage(chatId, replyText).catch(err => {
-            logWithTimestamp('error', `Failed to send command reply: ${err.message}`);
-        });
-        return;
-    }
-
-    // Check if SillyTavern is connected
-    if (!sillyTavernClient || sillyTavernClient.readyState !== WebSocket.OPEN) {
-        bot.sendMessage(chatId, 'SillyTavern not connected, cannot execute character and chat related commands. Please ensure SillyTavern is open and Telegram extension is enabled.');
-        return;
-    }
-
-    // Handle by command type
-    switch (command) {
-        case 'new':
-            // Send command to frontend for execution
-            sillyTavernClient.send(JSON.stringify({
-                type: 'execute_command',
-                command: 'new',
-                chatId: chatId
-            }));
-            return; // Frontend will send response, so return directly here
-        case 'listchars':
-            // Send command to frontend for execution
-            sillyTavernClient.send(JSON.stringify({
-                type: 'execute_command',
-                command: 'listchars',
-                chatId: chatId
-            }));
-            return;
-        case 'switchchar':
-            if (args.length === 0) {
-                replyText = 'Please provide character name or number. Usage: /switchchar <character name> or /switchchar_number';
-            } else {
-                // Send command to frontend for execution
-                sillyTavernClient.send(JSON.stringify({
-                    type: 'execute_command',
-                    command: 'switchchar',
-                    args: args,
-                    chatId: chatId
-                }));
-                return;
-            }
-            break;
-        case 'listchats':
-            // Send command to frontend for execution
-            sillyTavernClient.send(JSON.stringify({
-                type: 'execute_command',
-                command: 'listchats',
-                chatId: chatId
-            }));
-            return;
-        case 'switchchat':
-            if (args.length === 0) {
-                replyText = 'Please provide chat log name. Usage: /switchchat <chat log name>';
-            } else {
-                // Send command to frontend for execution
-                sillyTavernClient.send(JSON.stringify({
-                    type: 'execute_command',
-                    command: 'switchchat',
-                    args: args,
-                    chatId: chatId
-                }));
-                return;
-            }
-            break;
-        default:
-            // Handle special format commands like switchchar_1, switchchat_2, etc.
-            const charMatch = command.match(/^switchchar_(\d+)$/);
-            if (charMatch) {
-                // Send command to frontend for execution
-                sillyTavernClient.send(JSON.stringify({
-                    type: 'execute_command',
-                    command: command, // Keep original command format
-                    chatId: chatId
-                }));
-                return;
-            }
-
-            const chatMatch = command.match(/^switchchat_(\d+)$/);
-            if (chatMatch) {
-                // Send command to frontend for execution
-                sillyTavernClient.send(JSON.stringify({
-                    type: 'execute_command',
-                    command: command, // Keep original command format
-                    chatId: chatId
-                }));
-                return;
-            }
-    }
-
-    // Send reply
-    bot.sendMessage(chatId, replyText).catch(err => {
-        logWithTimestamp('error', `Failed to send command reply: ${err.message}`);
-    });
+/**
+ * Gets the stream key for a bot/chat combination
+ * @param {string} botId - Bot identifier
+ * @param {number} chatId - Telegram chat ID
+ * @returns {string} Unique stream key
+ */
+function getStreamKey(botId, chatId) {
+    return `${botId}_${chatId}`;
 }
 
-// --- WebSocket Server Logic ---
+// ============================================================================
+// WEBSOCKET SERVER
+// ============================================================================
+
+const wss = new WebSocket.Server({ port: wssPort });
+logWithTimestamp('log', `WebSocket server listening on port ${wssPort}...`);
+
+/** @type {WebSocket|null} */
+let sillyTavernClient = null;
+
 wss.on('connection', ws => {
     logWithTimestamp('log', 'SillyTavern extension connected!');
     sillyTavernClient = ws;
 
-    ws.on('message', async (message) => { // Set entire callback as async
-        let data; // Declare data outside try block
+    ws.on('message', async (message) => {
+        let data;
         try {
             data = JSON.parse(message);
 
-            // --- Handle streaming text chunks ---
-            if (data.type === 'stream_chunk' && data.chatId) {
-                let session = ongoingStreams.get(data.chatId);
+            // --- Handle character switch confirmation ---
+            // Check for isQueuedSwitch flag OR switchchar command when we have a pending switch
+            const isPendingSwitch = activeJob && activeJob.switchResolve && !activeJob.characterSwitched;
+            const isSwitchResponse = data.isQueuedSwitch || (isPendingSwitch && data.command === 'switchchar');
+            
+            if (data.type === 'command_executed' && isSwitchResponse) {
+                if (activeJob && activeJob.switchResolve) {
+                    if (data.success) {
+                        logWithTimestamp('log', `Character switch to "${data.characterName || 'unknown'}" confirmed`);
+                        activeJob.switchResolve();
+                    } else {
+                        logWithTimestamp('error', `Character switch failed: ${data.message}`);
+                        // Notify user of failure
+                        activeJob.job.bot.instance.sendMessage(activeJob.job.chatId, `Failed to switch character: ${data.message}`)
+                            .catch(err => logWithTimestamp('error', 'Failed to send switch error:', err.message));
+                        activeJob.switchReject(new Error(data.message || 'Character switch failed'));
+                        releaseJob();
+                    }
+                }
+                return;
+            }
 
-                // 1. If session doesn't exist, immediately create a placeholder session synchronously, create session and messagePromise
+            // --- Handle command execution results (non-switch) ---
+            if (data.type === 'command_executed' && !isSwitchResponse) {
+                logWithTimestamp('log', `Command ${data.command} execution completed: ${data.success ? 'success' : 'failure'}`);
+
+                // Find the bot to send the response
+                if (activeJob && data.botId === activeJob.job.bot.id) {
+                    if (data.message) {
+                        activeJob.job.bot.instance.sendMessage(activeJob.job.chatId, data.message)
+                            .catch(err => logWithTimestamp('error', 'Failed to send command result:', err.message));
+                    }
+                    releaseJob();
+                }
+                return;
+            }
+
+            // --- Handle streaming text chunks ---
+            if (data.type === 'stream_chunk' && data.chatId && data.botId) {
+                const streamKey = getStreamKey(data.botId, data.chatId);
+                const bot = managedBots.get(data.botId);
+
+                if (!bot) {
+                    logWithTimestamp('error', `Received stream_chunk for unknown bot: ${data.botId}`);
+                    return;
+                }
+
+                let session = ongoingStreams.get(streamKey);
+
                 if (!session) {
-                    // Declare with let to access inside Promise
                     let resolveMessagePromise;
                     const messagePromise = new Promise(resolve => {
                         resolveMessagePromise = resolve;
@@ -538,44 +761,41 @@ wss.on('connection', ws => {
                         messagePromise: messagePromise,
                         lastText: data.text,
                         timer: null,
-                        isEditing: false, // Add status lock
+                        isEditing: false,
                     };
-                    ongoingStreams.set(data.chatId, session);
+                    ongoingStreams.set(streamKey, session);
 
-                    // Asynchronously send first message and update session
-                    bot.sendMessage(data.chatId, 'Thinking...')
+                    bot.instance.sendMessage(data.chatId, 'Thinking...')
                         .then(sentMessage => {
-                            // When message is sent successfully, resolve Promise and pass messageId
                             resolveMessagePromise(sentMessage.message_id);
                         }).catch(err => {
-                            logWithTimestamp('error', 'Failed to send initial Telegram message:', err);
-                            ongoingStreams.delete(data.chatId); // Clean up on error
+                            logWithTimestamp('error', 'Failed to send initial streaming message:', err);
+                            ongoingStreams.delete(streamKey);
                         });
                 } else {
-                    // 2. If session exists, only update latest text
                     session.lastText = data.text;
                 }
 
-                // 3. Try to trigger one edit (throttling protection)
-                // Ensure messageId is obtained and no edit or timer is currently in progress
-                // Use await messagePromise to ensure messageId is available
+                // Throttled edit
                 const messageId = await session.messagePromise;
 
                 if (messageId && !session.isEditing && !session.timer) {
-                    session.timer = setTimeout(async () => { // Set timer callback as async too
-                        const currentSession = ongoingStreams.get(data.chatId);
+                    session.timer = setTimeout(async () => {
+                        const currentSession = ongoingStreams.get(streamKey);
                         if (currentSession) {
                             const currentMessageId = await currentSession.messagePromise;
                             if (currentMessageId) {
                                 currentSession.isEditing = true;
-                                bot.editMessageText(currentSession.lastText + ' ...', {
+                                bot.instance.editMessageText(currentSession.lastText + ' ...', {
                                     chat_id: data.chatId,
                                     message_id: currentMessageId,
                                 }).catch(err => {
                                     if (!err.message.includes('message is not modified'))
-                                        logWithTimestamp('error', 'Failed to edit Telegram message:', err.message);
+                                        logWithTimestamp('error', 'Failed to edit streaming message:', err.message);
                                 }).finally(() => {
-                                    if (ongoingStreams.has(data.chatId)) ongoingStreams.get(data.chatId).isEditing = false;
+                                    if (ongoingStreams.has(streamKey)) {
+                                        ongoingStreams.get(streamKey).isEditing = false;
+                                    }
                                 });
                             }
                             currentSession.timer = null;
@@ -586,187 +806,265 @@ wss.on('connection', ws => {
             }
 
             // --- Handle stream end signal ---
-            if (data.type === 'stream_end' && data.chatId) {
-                const session = ongoingStreams.get(data.chatId);
-                // Only process if session exists, indicating this is indeed streaming
+            if (data.type === 'stream_end' && data.chatId && data.botId) {
+                const streamKey = getStreamKey(data.botId, data.chatId);
+                const session = ongoingStreams.get(streamKey);
+
                 if (session) {
                     if (session.timer) {
                         clearTimeout(session.timer);
                     }
-                    logWithTimestamp('log', `Received stream end signal, waiting for final rendered text update...`);
-                    // Note: We don't clean up session here, wait for final_message_update instead
-                }
-                // If session doesn't exist but stream_end is received, this is an abnormal situation
-                // Session may have been cleaned up prematurely for some reason
-                else {
-                    logWithTimestamp('warn', `Received stream end signal, but cannot find corresponding session for ChatID ${data.chatId}`);
-                    // For safety, still send message, but this situation shouldn't happen
-                    await bot.sendMessage(data.chatId, data.text || "Message generation complete").catch(err => {
-                        logWithTimestamp('error', 'Failed to send stream end message:', err.message);
-                    });
+                    logWithTimestamp('log', `Stream end signal received, waiting for final update...`);
+                } else {
+                    logWithTimestamp('warn', `Received stream_end but no session found for ${streamKey}`);
                 }
                 return;
             }
 
-            // --- Handle final message update after rendering ---
-            if (data.type === 'final_message_update' && data.chatId) {
-                const session = ongoingStreams.get(data.chatId);
+            // --- Handle final message update ---
+            if (data.type === 'final_message_update' && data.chatId && data.botId) {
+                const streamKey = getStreamKey(data.botId, data.chatId);
+                const bot = managedBots.get(data.botId);
+                const session = ongoingStreams.get(streamKey);
 
-                // If session exists, this is the final update of streaming
+                if (!bot) {
+                    logWithTimestamp('error', `Received final_message_update for unknown bot: ${data.botId}`);
+                    return;
+                }
+
                 if (session) {
-                    // Use await messagePromise
                     const messageId = await session.messagePromise;
                     if (messageId) {
-                        logWithTimestamp('log', `Received final streamed rendered text, updating message ${messageId}`);
-                        await bot.editMessageText(data.text, {
+                        logWithTimestamp('log', `Sending final streamed message update`);
+                        await bot.instance.editMessageText(data.text, {
                             chat_id: data.chatId,
                             message_id: messageId,
-                            // Optional: specify parse_mode: 'MarkdownV2' or 'HTML' here
-                            // parse_mode: 'HTML',
                         }).catch(err => {
                             if (!err.message.includes('message is not modified'))
-                                logWithTimestamp('error', 'Failed to edit final formatted Telegram message:', err.message);
+                                logWithTimestamp('error', 'Failed to edit final message:', err.message);
                         });
-                        logWithTimestamp('log', `Streaming pre-final update sent for ChatID ${data.chatId}.`);
-                    } else {
-                        logWithTimestamp('warn', `Received final_message_update, but messageId from streaming session could not be obtained.`);
                     }
-                    // Clean up streaming session
-                    ongoingStreams.delete(data.chatId);
-                    logWithTimestamp('log', `Streaming session for ChatID ${data.chatId} completed and cleaned up.`);
+                    ongoingStreams.delete(streamKey);
+                    logWithTimestamp('log', `Streaming session ${streamKey} completed`);
+                } else {
+                    // Non-streaming reply
+                    logWithTimestamp('log', `Sending non-streaming reply`);
+                    await bot.instance.sendMessage(data.chatId, data.text)
+                        .catch(err => logWithTimestamp('error', 'Failed to send final message:', err.message));
                 }
-                // If session doesn't exist, this is a complete non-streaming reply
-                // Note: This shouldn't happen as we've fixed this on the client side
-                // But for robustness, we still keep this handling
-                else {
-                    logWithTimestamp('log', `Received non-streaming complete reply, sending new message directly to ChatID ${data.chatId}`);
-                    await bot.sendMessage(data.chatId, data.text, {
-                        // Optional: specify parse_mode here
-                    }).catch(err => {
-                        logWithTimestamp('error', 'Failed to send non-streaming complete reply:', err.message);
-                    });
+
+                // Release the job lock
+                releaseJob();
+                return;
+            }
+
+            // --- Handle AI reply (non-streaming) ---
+            if (data.type === 'ai_reply' && data.chatId && data.botId) {
+                const bot = managedBots.get(data.botId);
+                if (!bot) {
+                    logWithTimestamp('error', `Received ai_reply for unknown bot: ${data.botId}`);
+                    return;
+                }
+
+                logWithTimestamp('log', `Sending non-streaming AI reply`);
+                await bot.instance.sendMessage(data.chatId, data.text)
+                    .catch(err => logWithTimestamp('error', 'Failed to send AI reply:', err.message));
+
+                releaseJob();
+                return;
+            }
+
+            // --- Handle error messages ---
+            if (data.type === 'error_message' && data.chatId && data.botId) {
+                const bot = managedBots.get(data.botId);
+                if (!bot) {
+                    logWithTimestamp('error', `Received error_message for unknown bot: ${data.botId}`);
+                    return;
+                }
+
+                logWithTimestamp('error', `Error from SillyTavern: ${data.text}`);
+                await bot.instance.sendMessage(data.chatId, data.text)
+                    .catch(err => logWithTimestamp('error', 'Failed to send error message:', err.message));
+
+                releaseJob();
+                return;
+            }
+
+            // --- Handle typing action ---
+            if (data.type === 'typing_action' && data.chatId && data.botId) {
+                const bot = managedBots.get(data.botId);
+                if (bot) {
+                    bot.instance.sendChatAction(data.chatId, 'typing')
+                        .catch(err => logWithTimestamp('error', 'Failed to send typing action:', err.message));
                 }
                 return;
             }
 
-            // --- Other message handling logic ---
-            if (data.type === 'error_message' && data.chatId) {
-                logWithTimestamp('error', `Received error report from SillyTavern, sending to Telegram user ${data.chatId}: ${data.text}`);
-                bot.sendMessage(data.chatId, data.text);
-            } else if (data.type === 'ai_reply' && data.chatId) {
-                logWithTimestamp('log', `Received non-streaming AI reply, sending to Telegram user ${data.chatId}`);
-                // Ensure cleaning up any existing streaming session before sending message
-                if (ongoingStreams.has(data.chatId)) {
-                    logWithTimestamp('log', `Cleaning up streaming session for ChatID ${data.chatId} because non-streaming reply was received`);
-                    ongoingStreams.delete(data.chatId);
-                }
-                // Send non-streaming reply
-                await bot.sendMessage(data.chatId, data.text).catch(err => {
-                    logWithTimestamp('error', `Failed to send non-streaming AI reply: ${err.message}`);
-                });
-            } else if (data.type === 'typing_action' && data.chatId) {
-                logWithTimestamp('log', `Showing "typing" status to Telegram user ${data.chatId}`);
-                bot.sendChatAction(data.chatId, 'typing').catch(error =>
-                    logWithTimestamp('error', 'Failed to send "typing" status:', error));
-            } else if (data.type === 'command_executed') {
-                // Handle frontend command execution result
-                logWithTimestamp('log', `Command ${data.command} execution completed, result: ${data.success ? 'success' : 'failure'}`);
-                if (data.message) {
-                    logWithTimestamp('log', `Command execution message: ${data.message}`);
-                }
-            }
         } catch (error) {
             logWithTimestamp('error', 'Error processing SillyTavern message:', error);
-            // Ensure cleanup even when JSON parsing fails
-            if (data && data.chatId) {
-                ongoingStreams.delete(data.chatId);
+            if (data && data.chatId && data.botId) {
+                const streamKey = getStreamKey(data.botId, data.chatId);
+                ongoingStreams.delete(streamKey);
             }
+            releaseJob();
         }
     });
 
     ws.on('close', () => {
         logWithTimestamp('log', 'SillyTavern extension disconnected.');
-        if (ws.commandToExecuteOnClose) {
-            const { command, chatId } = ws.commandToExecuteOnClose;
-            logWithTimestamp('log', `Client disconnected, now executing scheduled command: ${command}`);
-            if (command === 'reload') reloadServer(chatId);
-            if (command === 'restart') restartServer(chatId);
-            if (command === 'exit') exitServer(chatId);
-        }
         sillyTavernClient = null;
         ongoingStreams.clear();
+        handleDisconnectDuringProcessing();
     });
 
     ws.on('error', (error) => {
         logWithTimestamp('error', 'WebSocket error occurred:', error);
-        if (sillyTavernClient) {
-            sillyTavernClient.commandToExecuteOnClose = null; // Clear marker to prevent accidental execution
-        }
         sillyTavernClient = null;
         ongoingStreams.clear();
+        handleDisconnectDuringProcessing();
     });
 });
 
-// Check if restart completion notification needs to be sent
-if (process.env.RESTART_NOTIFY_CHATID) {
-    const chatId = parseInt(process.env.RESTART_NOTIFY_CHATID);
-    if (!isNaN(chatId)) {
-        setTimeout(() => {
-            bot.sendMessage(chatId, 'Server-side component successfully restarted and ready')
-                .catch(err => logWithTimestamp('error', 'Failed to send restart notification:', err))
-                .finally(() => {
-                    delete process.env.RESTART_NOTIFY_CHATID;
-                });
-        }, 2000);
+// ============================================================================
+// SERVER LIFECYCLE MANAGEMENT
+// ============================================================================
+
+/**
+ * Reloads server configuration
+ * @param {number} chatId - Chat ID to notify
+ * @param {ManagedBot} managedBot - Bot to send notification through
+ */
+function reloadServer(chatId, managedBot) {
+    logWithTimestamp('log', 'Reloading server configuration...');
+
+    try {
+        delete require.cache[require.resolve('./config.js')];
+        const newConfig = require('./config.js');
+
+        if (!validateConfig(newConfig)) {
+            managedBot.instance.sendMessage(chatId, 'Configuration reload failed: Invalid configuration.')
+                .catch(err => logWithTimestamp('error', 'Failed to send error:', err.message));
+            return;
+        }
+
+        Object.assign(config, newConfig);
+        logWithTimestamp('log', 'Configuration reloaded successfully');
+        managedBot.instance.sendMessage(chatId, 'Configuration reloaded successfully.')
+            .catch(err => logWithTimestamp('error', 'Failed to send success:', err.message));
+    } catch (error) {
+        logWithTimestamp('error', 'Error reloading configuration:', error);
+        managedBot.instance.sendMessage(chatId, 'Error reloading configuration: ' + error.message)
+            .catch(err => logWithTimestamp('error', 'Failed to send error:', err.message));
     }
 }
 
-// Listen for Telegram messages
-bot.on('message', (msg) => {
-    const chatId = msg.chat.id;
-    const text = msg.text;
-    const userId = msg.from.id;
-    const username = msg.from.username || 'N/A';
+/**
+ * Restarts the server process
+ * @param {number} chatId - Chat ID to notify after restart
+ * @param {ManagedBot} managedBot - Bot to send notification through
+ */
+async function restartServer(chatId, managedBot) {
+    logWithTimestamp('log', 'Restarting server...');
 
-    // Check if whitelist is configured and not empty
-    if (config.allowedUserIds && config.allowedUserIds.length > 0) {
-        // If current user's ID is not in whitelist
-        if (!config.allowedUserIds.includes(userId)) {
-            logWithTimestamp('log', `Rejected access from non-whitelisted user:\n  - User ID: ${userId}\n  - Username: @${username}\n  - Chat ID: ${chatId}\n  - Message: "${text}"`);
-            // Send rejection message to this user
-            bot.sendMessage(chatId, 'Sorry, you are not authorized to use this bot.').catch(err => {
-                logWithTimestamp('error', `Failed to send rejection message to ${chatId}:`, err.message);
-            });
-            // Terminate further processing
-            return;
+    // Stop all bot polling
+    const stopPromises = [];
+    for (const [, bot] of managedBots) {
+        stopPromises.push(bot.instance.stopPolling().catch(err => {
+            logWithTimestamp('error', `Error stopping bot ${bot.characterName}:`, err);
+        }));
+    }
+    await Promise.all(stopPromises);
+
+    // Close WebSocket server
+    if (wss) {
+        wss.close(() => {
+            logWithTimestamp('log', 'WebSocket server closed, restarting...');
+            setTimeout(() => {
+                const { spawn } = require('child_process');
+                const serverPath = path.join(__dirname, 'server.js');
+                const cleanEnv = {
+                    PATH: process.env.PATH,
+                    NODE_PATH: process.env.NODE_PATH,
+                    TELEGRAM_CLEAR_UPDATES: '1',
+                    RESTART_NOTIFY_CHATID: chatId.toString(),
+                    RESTART_NOTIFY_BOT_TOKEN: managedBot.token
+                };
+                const child = spawn(process.execPath, [serverPath], { detached: true, stdio: 'inherit', env: cleanEnv });
+                child.unref();
+                process.exit(0);
+            }, 1000);
+        });
+    }
+}
+
+/**
+ * Gracefully shuts down the server
+ */
+async function exitServer() {
+    logWithTimestamp('log', 'Shutting down server...');
+
+    const forceExitTimeout = setTimeout(() => {
+        logWithTimestamp('error', 'Exit timeout, forcing process exit');
+        process.exit(1);
+    }, 10000);
+
+    try {
+        if (fs.existsSync(RESTART_PROTECTION_FILE)) {
+            fs.unlinkSync(RESTART_PROTECTION_FILE);
         }
+    } catch (error) {
+        logWithTimestamp('error', 'Failed to clean up restart protection file:', error);
     }
 
-    if (!text) return;
-
-    if (text.startsWith('/')) {
-        const parts = text.slice(1).trim().split(/\s+/);
-        const command = parts[0].toLowerCase();
-        const args = parts.slice(1);
-
-        // System commands are handled directly by server
-        if (['reload', 'restart', 'exit', 'ping'].includes(command)) {
-            handleSystemCommand(command, chatId);
-            return;
-        }
-
-        // Other commands are also handled by server, but may need frontend execution
-        handleTelegramCommand(command, args, chatId);
-        return;
+    // Stop all bot polling
+    const stopPromises = [];
+    for (const [, bot] of managedBots) {
+        stopPromises.push(bot.instance.stopPolling().catch(err => {
+            logWithTimestamp('error', `Error stopping bot ${bot.characterName}:`, err);
+        }));
     }
+    await Promise.all(stopPromises);
 
-    // Handle regular messages
-    if (sillyTavernClient && sillyTavernClient.readyState === WebSocket.OPEN) {
-        logWithTimestamp('log', `Received message from Telegram user ${chatId}: "${text}"`);
-        const payload = JSON.stringify({ type: 'user_message', chatId, text });
-        sillyTavernClient.send(payload);
+    if (wss) {
+        wss.close(() => {
+            logWithTimestamp('log', 'WebSocket server closed');
+            clearTimeout(forceExitTimeout);
+            logWithTimestamp('log', 'Server shut down successfully');
+            process.exit(0);
+        });
     } else {
-        logWithTimestamp('warn', 'Received Telegram message, but SillyTavern extension is not connected.');
-        bot.sendMessage(chatId, 'Sorry, I cannot connect to SillyTavern right now. Please ensure SillyTavern is open and the Telegram extension is enabled.');
+        clearTimeout(forceExitTimeout);
+        process.exit(0);
     }
+}
+
+// ============================================================================
+// STARTUP
+// ============================================================================
+
+// Initialize all bots
+initializeBots().then(() => {
+    logWithTimestamp('log', 'All bots initialized and ready');
+
+    // Send restart notification if applicable
+    if (process.env.RESTART_NOTIFY_CHATID && process.env.RESTART_NOTIFY_BOT_TOKEN) {
+        const chatId = parseInt(process.env.RESTART_NOTIFY_CHATID);
+        const botToken = process.env.RESTART_NOTIFY_BOT_TOKEN;
+        const botId = getBotIdFromToken(botToken);
+        const bot = managedBots.get(botId);
+
+        if (!isNaN(chatId) && bot) {
+            setTimeout(() => {
+                bot.instance.sendMessage(chatId, 'Server successfully restarted and ready.')
+                    .catch(err => logWithTimestamp('error', 'Failed to send restart notification:', err.message))
+                    .finally(() => {
+                        delete process.env.RESTART_NOTIFY_CHATID;
+                        delete process.env.RESTART_NOTIFY_BOT_TOKEN;
+                    });
+            }, 2000);
+        }
+    }
+}).catch(error => {
+    logWithTimestamp('error', 'Failed to initialize bots:', error);
+    process.exit(1);
 });
