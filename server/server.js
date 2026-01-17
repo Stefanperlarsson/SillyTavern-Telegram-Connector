@@ -201,6 +201,88 @@ const wssPort = config.wssPort || 2333;
 // REQUEST QUEUE & MUTEX SYSTEM
 // ============================================================================
 
+// ============================================================================
+// MESSAGE BATCHING & DEBOUNCE
+// ============================================================================
+
+const DEBOUNCE_MS = 10000;
+
+/** 
+ * Buffers for user messages
+ * Key: chatId (number)
+ * Value: { timer: NodeJS.Timeout, messages: Array<{text, files}>, bot: ManagedBot, userId: number, targetCharacter: string }
+ * @type {Map<number, Object>} 
+ */
+const userMessageBuffers = new Map();
+
+/**
+ * Adds a user message to the buffer and resets the debounce timer
+ * @param {ManagedBot} bot - The bot receiving the message
+ * @param {number} chatId - Telegram chat ID
+ * @param {number} userId - Telegram user ID
+ * @param {string} text - Message text
+ * @param {FileAttachment[]} [files] - File attachments
+ */
+function debounceUserMessage(bot, chatId, userId, text, files) {
+    let buffer = userMessageBuffers.get(chatId);
+
+    if (buffer) {
+        clearTimeout(buffer.timer);
+    } else {
+        buffer = {
+            messages: [],
+            bot: bot,
+            userId: userId,
+            targetCharacter: bot.characterName
+        };
+        userMessageBuffers.set(chatId, buffer);
+    }
+
+    if (text || (files && files.length > 0)) {
+        buffer.messages.push({
+            text: text,
+            files: files
+        });
+        logWithTimestamp('log', `Buffered message for chat ${chatId} (buffer size: ${buffer.messages.length})`);
+    }
+
+    buffer.timer = setTimeout(() => {
+        flushUserMessageBuffer(chatId);
+    }, DEBOUNCE_MS);
+}
+
+/**
+ * Flushes the message buffer for a chat, creating a single batch job
+ * @param {number} chatId - The chat ID to flush
+ */
+function flushUserMessageBuffer(chatId) {
+    const buffer = userMessageBuffers.get(chatId);
+    if (!buffer) return;
+
+    userMessageBuffers.delete(chatId);
+
+    if (buffer.messages.length === 0) return;
+
+    logWithTimestamp('log', `Flushing buffer for chat ${chatId} with ${buffer.messages.length} messages`);
+
+    const lastMsg = buffer.messages[buffer.messages.length - 1];
+    
+    const job = {
+        id: '', 
+        bot: buffer.bot,
+        chatId: chatId,
+        userId: buffer.userId,
+        text: lastMsg.text || '(Batch Request)',
+        targetCharacter: buffer.targetCharacter,
+        type: 'message',
+        messages: buffer.messages,
+        files: undefined,
+        timestamp: 0
+    };
+
+    enqueueJob(job);
+}
+
 /** @type {QueueJob[]} */
 const requestQueue = [];
 
@@ -379,47 +461,56 @@ async function sendUserMessage(job) {
     job.bot.instance.sendChatAction(job.chatId, 'typing')
         .catch(err => logWithTimestamp('error', 'Failed to send typing action:', err.message));
 
-    // Download any file attachments
-    let fileAttachments = undefined;
-    if (job.files && job.files.length > 0) {
-        logWithTimestamp('log', `Downloading ${job.files.length} file(s) from Telegram...`);
-        fileAttachments = [];
+    // Prepare messages array for payload
+    const payloadMessages = [];
+    
+    // Check if it's a batch job or legacy single job
+    const sourceMessages = job.messages || [{ text: job.text, files: job.files }];
+
+    for (const msg of sourceMessages) {
+        let fileAttachments = undefined;
         
-        for (const file of job.files) {
-            const downloaded = await downloadTelegramFile(
-                job.bot.instance,
-                file.fileId,
-                file.fileName,
-                file.mimeType
-            );
+        if (msg.files && msg.files.length > 0) {
+            logWithTimestamp('log', `Downloading ${msg.files.length} file(s) from Telegram...`);
+            fileAttachments = [];
             
-            if (downloaded) {
-                fileAttachments.push(downloaded);
-                logWithTimestamp('log', `Successfully downloaded: ${file.fileName}`);
-            } else {
-                logWithTimestamp('error', `Failed to download: ${file.fileName}`);
+            for (const file of msg.files) {
+                const downloaded = await downloadTelegramFile(
+                    job.bot.instance,
+                    file.fileId,
+                    file.fileName,
+                    file.mimeType
+                );
+                
+                if (downloaded) {
+                    fileAttachments.push(downloaded);
+                    logWithTimestamp('log', `Successfully downloaded: ${file.fileName}`);
+                } else {
+                    logWithTimestamp('error', `Failed to download: ${file.fileName}`);
+                }
+            }
+            
+            if (fileAttachments.length === 0) {
+                fileAttachments = undefined;
             }
         }
         
-        logWithTimestamp('log', `Downloaded ${fileAttachments.length}/${job.files.length} files`);
-        
-        // Only include if we have files
-        if (fileAttachments.length === 0) {
-            fileAttachments = undefined;
-        }
+        payloadMessages.push({
+            text: msg.text,
+            files: fileAttachments
+        });
     }
 
     // Send the message to SillyTavern
     const payload = {
         type: 'user_message',
         chatId: job.chatId,
-        text: job.text,
         botId: job.bot.id,
         characterName: job.targetCharacter,
-        files: fileAttachments,
+        messages: payloadMessages
     };
     
-    logWithTimestamp('log', `Sending to SillyTavern: text="${job.text.substring(0, 30)}...", files=${fileAttachments?.length || 0}`);
+    logWithTimestamp('log', `Sending to SillyTavern: ${payloadMessages.length} messages`);
     sillyTavernClient.send(JSON.stringify(payload));
 }
 
@@ -638,20 +729,13 @@ function processMediaGroup(groupKey) {
     
     logWithTimestamp('log', `Processing media group: ${group.messages.length} messages, ${allFiles.length} files, caption="${caption.substring(0, 30)}..."`);
     
-    // Create a single job with all files
-    const job = {
-        id: '',
-        bot: group.bot,
-        chatId: group.chatId,
-        userId: group.userId,
-        text: caption,
-        targetCharacter: group.bot.characterName,
-        type: 'message',
-        files: allFiles.length > 0 ? allFiles : undefined,
-        timestamp: 0
-    };
-    
-    enqueueJob(job);
+    debounceUserMessage(
+        group.bot, 
+        group.chatId, 
+        group.userId, 
+        caption, 
+        allFiles.length > 0 ? allFiles : undefined
+    );
 }
 
 /**
@@ -728,21 +812,8 @@ function setupBotHandlers(managedBot) {
             return;
         }
 
-        // Handle regular messages - enqueue for processing
-        /** @type {QueueJob} */
-        const job = {
-            id: '', // Will be set by enqueueJob
-            bot: managedBot,
-            chatId: chatId,
-            userId: userId,
-            text: text,
-            targetCharacter: managedBot.characterName,
-            type: 'message',
-            files: files.length > 0 ? files : undefined,
-            timestamp: 0 // Will be set by enqueueJob
-        };
-
-        enqueueJob(job);
+        // Handle regular messages - buffer for batching
+        debounceUserMessage(managedBot, chatId, userId, text, files.length > 0 ? files : undefined);
     });
 }
 
@@ -1254,11 +1325,16 @@ wss.on('connection', ws => {
                     await sendImagesToTelegram(bot, data.chatId, data.images);
                 }
 
+                // Split the final text by newlines
+                const parts = data.text.split('\n');
+                const firstPart = parts[0];
+                const remainingParts = parts.slice(1);
+
                 if (session) {
                     const messageId = await session.messagePromise;
                     if (messageId) {
                         logWithTimestamp('log', `Sending final streamed message update`);
-                        await bot.instance.editMessageText(data.text, {
+                        await bot.instance.editMessageText(firstPart, {
                             chat_id: data.chatId,
                             message_id: messageId,
                         }).catch(err => {
@@ -1271,8 +1347,17 @@ wss.on('connection', ws => {
                 } else {
                     // Non-streaming reply
                     logWithTimestamp('log', `Sending non-streaming reply`);
-                    await bot.instance.sendMessage(data.chatId, data.text)
+                    await bot.instance.sendMessage(data.chatId, firstPart)
                         .catch(err => logWithTimestamp('error', 'Failed to send final message:', err.message));
+                }
+
+                // Send remaining parts as new messages
+                for (const part of remainingParts) {
+                    if (part.trim().length > 0) {
+                        logWithTimestamp('log', `Sending split message part`);
+                        await bot.instance.sendMessage(data.chatId, part)
+                            .catch(err => logWithTimestamp('error', 'Failed to send split message:', err.message));
+                    }
                 }
 
                 // Release the job lock
@@ -1294,9 +1379,16 @@ wss.on('connection', ws => {
                     await sendImagesToTelegram(bot, data.chatId, data.images);
                 }
 
-                logWithTimestamp('log', `Sending non-streaming AI reply`);
-                await bot.instance.sendMessage(data.chatId, data.text)
-                    .catch(err => logWithTimestamp('error', 'Failed to send AI reply:', err.message));
+                logWithTimestamp('log', `Sending non-streaming AI reply (split by newlines)`);
+                
+                const parts = data.text.split('\n');
+                
+                for (const part of parts) {
+                    if (part.trim().length > 0) {
+                        await bot.instance.sendMessage(data.chatId, part)
+                            .catch(err => logWithTimestamp('error', 'Failed to send AI reply part:', err.message));
+                    }
+                }
 
                 releaseJob();
                 return;
