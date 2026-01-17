@@ -540,6 +540,73 @@ async function clearAndStartPollingAll() {
     }
 }
 
+// ============================================================================
+// MEDIA GROUP HANDLING
+// ============================================================================
+
+/**
+ * Pending media groups waiting to be combined
+ * Key: `${botId}_${chatId}_${mediaGroupId}`
+ * @type {Map<string, {messages: Array, timer: NodeJS.Timeout, bot: ManagedBot, chatId: number, userId: number}>}
+ */
+const pendingMediaGroups = new Map();
+
+/** Delay before processing a media group (ms) */
+const MEDIA_GROUP_DELAY = 500;
+
+/**
+ * Gets a unique key for a media group
+ * @param {string} botId - Bot identifier
+ * @param {number} chatId - Chat ID
+ * @param {string} mediaGroupId - Telegram media group ID
+ * @returns {string}
+ */
+function getMediaGroupKey(botId, chatId, mediaGroupId) {
+    return `${botId}_${chatId}_${mediaGroupId}`;
+}
+
+/**
+ * Processes a completed media group into a single job
+ * @param {string} groupKey - The media group key
+ */
+function processMediaGroup(groupKey) {
+    const group = pendingMediaGroups.get(groupKey);
+    if (!group) return;
+    
+    pendingMediaGroups.delete(groupKey);
+    
+    // Combine all files from all messages
+    const allFiles = [];
+    let caption = '';
+    
+    for (const msg of group.messages) {
+        const files = extractFileAttachments(msg);
+        allFiles.push(...files);
+        
+        // Use caption from first message that has one
+        if (!caption && msg.caption) {
+            caption = msg.caption;
+        }
+    }
+    
+    logWithTimestamp('log', `Processing media group: ${group.messages.length} messages, ${allFiles.length} files, caption="${caption.substring(0, 30)}..."`);
+    
+    // Create a single job with all files
+    const job = {
+        id: '',
+        bot: group.bot,
+        chatId: group.chatId,
+        userId: group.userId,
+        text: caption,
+        targetCharacter: group.bot.characterName,
+        type: 'message',
+        files: allFiles.length > 0 ? allFiles : undefined,
+        timestamp: 0
+    };
+    
+    enqueueJob(job);
+}
+
 /**
  * Sets up message and command handlers for a bot
  * @param {ManagedBot} managedBot - The managed bot instance
@@ -558,6 +625,39 @@ function setupBotHandlers(managedBot) {
                     .catch(err => logWithTimestamp('error', 'Failed to send rejection message:', err.message));
                 return;
             }
+        }
+
+        // Handle media groups (albums) - buffer and combine
+        if (msg.media_group_id) {
+            const groupKey = getMediaGroupKey(managedBot.id, chatId, msg.media_group_id);
+            
+            let group = pendingMediaGroups.get(groupKey);
+            if (!group) {
+                // First message in this media group
+                group = {
+                    messages: [],
+                    timer: null,
+                    bot: managedBot,
+                    chatId: chatId,
+                    userId: userId,
+                };
+                pendingMediaGroups.set(groupKey, group);
+                logWithTimestamp('log', `Started collecting media group: ${msg.media_group_id}`);
+            }
+            
+            // Add this message to the group
+            group.messages.push(msg);
+            logWithTimestamp('log', `Added message to media group ${msg.media_group_id}, total: ${group.messages.length}`);
+            
+            // Reset/set the timer - process after MEDIA_GROUP_DELAY ms of no new messages
+            if (group.timer) {
+                clearTimeout(group.timer);
+            }
+            group.timer = setTimeout(() => {
+                processMediaGroup(groupKey);
+            }, MEDIA_GROUP_DELAY);
+            
+            return; // Don't process individually
         }
 
         // Extract text - use caption for media messages, otherwise use text

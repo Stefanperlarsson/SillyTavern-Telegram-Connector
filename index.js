@@ -178,6 +178,13 @@ function scanMessagesForMedia(startIndex, endIndex) {
     
     for (let i = startIndex; i < endIndex; i++) {
         const msg = context.chat[i];
+        
+        // Skip user messages - we don't want to send user's own images back to them
+        if (msg?.is_user) {
+            log('log', `  Message ${i}: skipping (is_user=true)`);
+            continue;
+        }
+        
         const hasMedia = msg?.extra?.media?.length > 0;
         log('log', `  Message ${i}: hasMedia=${hasMedia}, is_user=${msg?.is_user}, is_system=${msg?.is_system}`);
         
@@ -252,9 +259,9 @@ async function processFileAttachments(files) {
             
             // Upload to SillyTavern server using saveBase64AsFile
             // Parameters: (base64Data, uniqueId, prefix, extension)
-            const context = SillyTavern.getContext();
-            const userName = context.name1 || 'user';
-            const url = await saveBase64AsFile(file.base64, userName, 'telegram', ext);
+            // Use timestamp + random string to ensure unique filenames
+            const uniqueId = `${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+            const url = await saveBase64AsFile(file.base64, uniqueId, 'telegram', ext);
             
             log('log', `File uploaded successfully: ${url}`);
             
