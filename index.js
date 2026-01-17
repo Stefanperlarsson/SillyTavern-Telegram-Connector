@@ -41,11 +41,20 @@ const DEFAULT_SETTINGS = {
 let ws = null;
 
 /**
+ * @typedef {Object} MediaItem
+ * @property {string} type - Media type ('image', 'video', 'audio')
+ * @property {string} url - Media URL (relative path or base64)
+ * @property {string} [title] - Optional title/prompt
+ */
+
+/**
  * @typedef {Object} ActiveRequest
  * @property {number} chatId - Telegram chat ID
  * @property {string} botId - Bot identifier
  * @property {string} characterName - Character being used
  * @property {boolean} isStreaming - Whether streaming is active
+ * @property {number} startMessageIndex - Chat index when request started
+ * @property {MediaItem[]} collectedMedia - Media collected during this request
  */
 
 /** @type {ActiveRequest|null} */
@@ -103,6 +112,86 @@ function log(level, ...args) {
         default:
             console.log(prefix, ...args);
     }
+}
+
+// ============================================================================
+// IMAGE HANDLING
+// ============================================================================
+
+/**
+ * Fetches an image from a URL and converts it to base64
+ * @param {string} imageUrl - The image URL (relative or absolute)
+ * @returns {Promise<{base64: string, mimeType: string}|null>} Base64 data or null on error
+ */
+async function fetchImageAsBase64(imageUrl) {
+    try {
+        // Handle relative URLs by prepending the origin
+        const fullUrl = imageUrl.startsWith('/') 
+            ? `${window.location.origin}${imageUrl}` 
+            : imageUrl;
+        
+        log('log', `Fetching image from: ${fullUrl}`);
+        
+        const response = await fetch(fullUrl);
+        if (!response.ok) {
+            log('error', `Failed to fetch image: ${response.status} ${response.statusText}`);
+            return null;
+        }
+        
+        const blob = await response.blob();
+        const mimeType = blob.type || 'image/png';
+        
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onloadend = () => {
+                // reader.result is "data:image/png;base64,xxxxx"
+                // Extract just the base64 part
+                const base64Data = reader.result.split(',')[1];
+                resolve({ base64: base64Data, mimeType: mimeType });
+            };
+            reader.onerror = reject;
+            reader.readAsDataURL(blob);
+        });
+    } catch (error) {
+        log('error', `Error fetching image: ${error.message}`);
+        return null;
+    }
+}
+
+/**
+ * Scans messages created during the current request for media
+ * @param {number} startIndex - Index to start scanning from
+ * @param {number} endIndex - Index to stop scanning at (exclusive)
+ * @returns {MediaItem[]} Array of media items found
+ */
+function scanMessagesForMedia(startIndex, endIndex) {
+    const context = SillyTavern.getContext();
+    const mediaItems = [];
+    
+    log('log', `scanMessagesForMedia: checking messages ${startIndex} to ${endIndex - 1}`);
+    
+    for (let i = startIndex; i < endIndex; i++) {
+        const msg = context.chat[i];
+        const hasMedia = msg?.extra?.media?.length > 0;
+        log('log', `  Message ${i}: hasMedia=${hasMedia}, is_user=${msg?.is_user}, is_system=${msg?.is_system}`);
+        
+        if (hasMedia) {
+            for (const media of msg.extra.media) {
+                log('log', `    Media found: type=${media.type}, hasUrl=${!!media.url}, urlLen=${media.url?.length}`);
+                if (media.type === 'image' && media.url) {
+                    mediaItems.push({
+                        type: media.type,
+                        url: media.url,
+                        title: media.title || ''
+                    });
+                    log('log', `    -> Added to mediaItems`);
+                }
+            }
+        }
+    }
+    
+    log('log', `scanMessagesForMedia: returning ${mediaItems.length} items`);
+    return mediaItems;
 }
 
 // ============================================================================
@@ -485,12 +574,18 @@ async function handleUserMessage(data) {
     const botId = data.botId;
     const characterName = data.characterName;
 
+    // Get current chat length to track new messages
+    const context = SillyTavern.getContext();
+    const startMessageIndex = context.chat.length;
+
     // Set up active request tracking
     activeRequest = {
         chatId: chatId,
         botId: botId,
         characterName: characterName,
-        isStreaming: false
+        isStreaming: false,
+        startMessageIndex: startMessageIndex,
+        collectedMedia: []
     };
 
     // Send typing indicator
@@ -541,9 +636,23 @@ async function handleUserMessage(data) {
         log('error', 'Generate() error:', error);
         errorOccurred = true;
 
-        // Delete the user message that caused the error
-        await deleteLastMessage();
-        log('log', 'Deleted user message that caused the error.');
+        // Delete all messages created since the request started
+        // This includes: user message, any tool call messages, failed AI responses
+        const currentContext = SillyTavern.getContext();
+        const messagesToDelete = currentContext.chat.length - startMessageIndex;
+        
+        log('log', `Cleaning up ${messagesToDelete} messages (from index ${startMessageIndex} to ${currentContext.chat.length - 1})`);
+        
+        // Delete messages in reverse order (newest first)
+        for (let i = 0; i < messagesToDelete; i++) {
+            try {
+                await deleteLastMessage();
+                log('log', `Deleted message ${i + 1}/${messagesToDelete}`);
+            } catch (deleteError) {
+                log('error', `Failed to delete message: ${deleteError.message}`);
+                break; // Stop if deletion fails
+            }
+        }
 
         // Send error message
         const errorMessage = `Sorry, an error occurred while generating a reply.\nYour previous message has been retracted, please retry or send different content.\n\nError details: ${error.message || 'Unknown error'}`;
@@ -571,7 +680,7 @@ async function handleUserMessage(data) {
  * Extracts rendered text from the DOM and sends it to the server
  * @param {number} lastMessageIdInChatArray - Index of the last message in the chat array
  */
-function handleFinalMessage(lastMessageIdInChatArray) {
+async function handleFinalMessage(lastMessageIdInChatArray) {
     log('log', `handleFinalMessage called with index: ${lastMessageIdInChatArray}, activeRequest:`, activeRequest);
     
     // Ensure we have an active request to respond to
@@ -584,95 +693,84 @@ function handleFinalMessage(lastMessageIdInChatArray) {
     if (lastMessageIndex < 0) return;
 
     // Small delay to ensure DOM update is complete
-    setTimeout(() => {
-        const context = SillyTavern.getContext();
-        const lastMessage = context.chat[lastMessageIndex];
+    await new Promise(resolve => setTimeout(resolve, 100));
+    
+    const context = SillyTavern.getContext();
+    const lastMessage = context.chat[lastMessageIndex];
 
-        // === IMAGE SUPPORT DEBUG LOGGING ===
-        log('log', '=== MESSAGE PAYLOAD DEBUG ===');
-        log('log', 'Current message index:', lastMessageIndex);
-        log('log', 'lastMessage object:', JSON.stringify(lastMessage, null, 2));
-        
-        // Check for media attachments (images stored in extra.media array)
-        if (lastMessage?.extra?.media?.length > 0) {
-            log('log', '*** FOUND MEDIA IN CURRENT MESSAGE ***');
-            log('log', 'Media count:', lastMessage.extra.media.length);
-            lastMessage.extra.media.forEach((media, idx) => {
-                log('log', `Media ${idx}:`, {
-                    type: media.type,
-                    source: media.source,
-                    title: media.title,
-                    urlPreview: media.url?.substring(0, 100) + '...',
-                    urlLength: media.url?.length
-                });
-            });
-        }
-        
-        // Scan recent messages to find any with images
-        log('log', '=== SCANNING RECENT MESSAGES FOR MEDIA ===');
-        const chatLength = context.chat.length;
-        const startIdx = Math.max(0, chatLength - 6);
-        for (let i = startIdx; i < chatLength; i++) {
-            const msg = context.chat[i];
-            const hasMedia = msg?.extra?.media?.length > 0;
-            log('log', `Message ${i}:`, {
-                is_user: msg?.is_user,
-                is_system: msg?.is_system,
-                name: msg?.name,
-                hasMedia: hasMedia,
-                mediaCount: msg?.extra?.media?.length || 0,
-                mesPreview: msg?.mes?.substring(0, 60) + (msg?.mes?.length > 60 ? '...' : '')
-            });
-            if (hasMedia) {
-                log('log', `  -> Media details for message ${i}:`);
-                msg.extra.media.forEach((media, idx) => {
-                    log('log', `     Media ${idx}: type=${media.type}, source=${media.source}, urlLen=${media.url?.length}`);
-                });
-            }
-        }
-        // === END DEBUG LOGGING ===
+    // Scan for media generated during this request
+    const startIdx = activeRequest.startMessageIndex || 0;
+    log('log', `Scanning for media from index ${startIdx} to ${context.chat.length - 1} (chat length: ${context.chat.length})`);
+    const mediaItems = scanMessagesForMedia(startIdx, context.chat.length);
+    log('log', `Found ${mediaItems.length} media items total`);
+    
+    // Debug: show what we found
+    if (mediaItems.length > 0) {
+        mediaItems.forEach((item, idx) => {
+            log('log', `  Media item ${idx}: type=${item.type}, url=${item.url?.substring(0, 50)}...`);
+        });
+    }
 
-        // Confirm this is the AI reply we just triggered
-        if (lastMessage && !lastMessage.is_user && !lastMessage.is_system) {
-            const messageElement = $(`#chat .mes[mesid="${lastMessageIndex}"]`);
+    // Confirm this is the AI reply we just triggered
+    if (lastMessage && !lastMessage.is_user && !lastMessage.is_system) {
+        const messageElement = $(`#chat .mes[mesid="${lastMessageIndex}"]`);
 
-            if (messageElement.length > 0) {
-                const messageTextElement = messageElement.find('.mes_text');
+        if (messageElement.length > 0) {
+            const messageTextElement = messageElement.find('.mes_text');
 
-                // Get HTML content and convert to plain text
-                let renderedText = messageTextElement.html()
-                    .replace(/<br\s*\/?>/gi, '\n')
-                    .replace(/<\/p>\s*<p>/gi, '\n\n');
+            // Get HTML content and convert to plain text
+            let renderedText = messageTextElement.html()
+                .replace(/<br\s*\/?>/gi, '\n')
+                .replace(/<\/p>\s*<p>/gi, '\n\n');
 
-                // Decode HTML entities
-                const tempDiv = document.createElement('div');
-                tempDiv.innerHTML = renderedText;
-                renderedText = tempDiv.textContent;
+            // Decode HTML entities
+            const tempDiv = document.createElement('div');
+            tempDiv.innerHTML = renderedText;
+            renderedText = tempDiv.textContent;
 
-                log('log', `Sending final message to bot ${activeRequest.botId}`);
-
-                // Send appropriate message type based on streaming state
-                if (activeRequest.isStreaming) {
-                    sendToServer({
-                        type: 'final_message_update',
-                        chatId: activeRequest.chatId,
-                        botId: activeRequest.botId,
-                        text: renderedText,
-                    });
-                } else {
-                    sendToServer({
-                        type: 'ai_reply',
-                        chatId: activeRequest.chatId,
-                        botId: activeRequest.botId,
-                        text: renderedText,
-                    });
+            // Fetch and convert images to base64 for transmission
+            const images = [];
+            for (const media of mediaItems) {
+                if (media.type === 'image') {
+                    const imageData = await fetchImageAsBase64(media.url);
+                    if (imageData) {
+                        images.push({
+                            base64: imageData.base64,
+                            mimeType: imageData.mimeType,
+                            caption: media.title || ''
+                        });
+                        log('log', `Prepared image for sending: ${imageData.mimeType}, ${imageData.base64.length} chars`);
+                    }
                 }
-
-                // Clear active request
-                activeRequest = null;
             }
+
+            log('log', `Sending final message to bot ${activeRequest.botId} with ${images.length} images`);
+
+            // Build the payload
+            const payload = {
+                chatId: activeRequest.chatId,
+                botId: activeRequest.botId,
+                text: renderedText,
+                images: images.length > 0 ? images : undefined,
+            };
+
+            // Send appropriate message type based on streaming state
+            if (activeRequest.isStreaming) {
+                sendToServer({
+                    type: 'final_message_update',
+                    ...payload,
+                });
+            } else {
+                sendToServer({
+                    type: 'ai_reply',
+                    ...payload,
+                });
+            }
+
+            // Clear active request
+            activeRequest = null;
         }
-    }, 100);
+    }
 }
 
 // Register global event listeners for final message handling
