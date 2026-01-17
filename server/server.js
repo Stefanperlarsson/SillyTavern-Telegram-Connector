@@ -584,6 +584,14 @@ async function executeCommand(job) {
 function releaseJob() {
     if (activeJob) {
         logWithTimestamp('log', `Releasing job ${activeJob.job.id}`);
+        
+        // Clear any active chat actions for this job
+        const actionKey = getStreamKey(activeJob.job.bot.id, activeJob.job.chatId);
+        if (activeChatActions.has(actionKey)) {
+            logWithTimestamp('log', `Stopping active chat action for ${actionKey}`);
+            clearInterval(activeChatActions.get(actionKey));
+            activeChatActions.delete(actionKey);
+        }
     }
     activeJob = null;
     isProcessing = false;
@@ -615,6 +623,13 @@ function handleDisconnectDuringProcessing() {
     requestQueue.length = 0;
 
     // Release lock
+    if (activeJob) {
+        const actionKey = getStreamKey(activeJob.job.bot.id, activeJob.job.chatId);
+        if (activeChatActions.has(actionKey)) {
+            clearInterval(activeChatActions.get(actionKey));
+            activeChatActions.delete(actionKey);
+        }
+    }
     activeJob = null;
     isProcessing = false;
 }
@@ -1056,6 +1071,7 @@ function handleSystemCommand(command, chatId, managedBot) {
  * @type {Map<string, StreamSession>}
  */
 const ongoingStreams = new Map();
+const activeChatActions = new Map();
 
 // ============================================================================
 // IMAGE HANDLING
@@ -1516,6 +1532,37 @@ wss.on('connection', ws => {
                 return;
             }
 
+            // --- Handle general chat action (with keep-alive) ---
+            if (data.type === 'chat_action' && data.chatId && data.botId) {
+                const bot = managedBots.get(data.botId);
+                if (bot) {
+                    const actionKey = getStreamKey(data.botId, data.chatId);
+                    
+                    // Clear existing interval if any
+                    if (activeChatActions.has(actionKey)) {
+                        clearInterval(activeChatActions.get(actionKey));
+                    }
+
+                    const sendAction = () => {
+                        bot.instance.sendChatAction(data.chatId, data.action || 'upload_photo')
+                            .catch(err => {
+                                logWithTimestamp('error', `Failed to send chat action (${data.action}):`, err.message);
+                                // If error occurs (e.g. user blocked bot), stop the interval
+                                if (activeChatActions.has(actionKey)) {
+                                    clearInterval(activeChatActions.get(actionKey));
+                                    activeChatActions.delete(actionKey);
+                                }
+                            });
+                    };
+
+                    // Send immediately and start interval
+                    sendAction();
+                    const intervalId = setInterval(sendAction, 4000);
+                    activeChatActions.set(actionKey, intervalId);
+                }
+                return;
+            }
+
         } catch (error) {
             logWithTimestamp('error', 'Error processing SillyTavern message:', error);
             if (data && data.chatId && data.botId) {
@@ -1530,6 +1577,10 @@ wss.on('connection', ws => {
         logWithTimestamp('log', 'SillyTavern extension disconnected.');
         sillyTavernClient = null;
         ongoingStreams.clear();
+        for (const intervalId of activeChatActions.values()) {
+            clearInterval(intervalId);
+        }
+        activeChatActions.clear();
         handleDisconnectDuringProcessing();
     });
 
@@ -1537,6 +1588,10 @@ wss.on('connection', ws => {
         logWithTimestamp('error', 'WebSocket error occurred:', error);
         sillyTavernClient = null;
         ongoingStreams.clear();
+        for (const intervalId of activeChatActions.values()) {
+            clearInterval(intervalId);
+        }
+        activeChatActions.clear();
         handleDisconnectDuringProcessing();
     });
 });
