@@ -21,6 +21,7 @@ import {
     openCharacterChat,
     Generate,
     setExternalAbortController,
+    appendMediaToMessage,
 } from "../../../../script.js";
 
 // Import utility functions for file handling
@@ -769,6 +770,19 @@ async function handleUserMessage(data) {
             Object.assign(userMessage.extra, fileExtras);
             
             log('log', `User message extra after merge:`, JSON.stringify(userMessage.extra, null, 2));
+            
+            // Render the media in the UI
+            try {
+                const messageElement = $(`#chat .mes[mesid="${userMessageIndex}"]`);
+                if (messageElement.length > 0) {
+                    appendMediaToMessage(userMessage, messageElement, false);
+                    log('log', `Media rendered in UI for message ${userMessageIndex}`);
+                } else {
+                    log('warn', `Could not find message element for index ${userMessageIndex}`);
+                }
+            } catch (renderError) {
+                log('error', `Failed to render media: ${renderError.message}`);
+            }
             
             // Save the chat to persist the changes
             try {
