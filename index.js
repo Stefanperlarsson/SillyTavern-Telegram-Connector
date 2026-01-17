@@ -655,6 +655,47 @@ async function handleExecuteCommand(data) {
                 }
                 break;
 
+            // --- Delete Messages ---
+            case 'delete_messages':
+                const count = data.args && data.args.length > 0 ? parseInt(data.args[0]) : 1;
+                let deleted = 0;
+                for (let i = 0; i < count; i++) {
+                    // Safety check: don't delete if chat is empty
+                    if (SillyTavern.getContext().chat.length === 0) break;
+                    try {
+                        await deleteLastMessage();
+                        deleted++;
+                    } catch (e) {
+                        log('error', 'Failed to delete message:', e);
+                        break;
+                    }
+                }
+                result = {
+                    success: true,
+                    message: `Deleted ${deleted} message(s).`
+                };
+                break;
+
+            // --- Trigger Generation ---
+            case 'trigger_generation':
+                if (activeRequest) {
+                     result = {
+                        success: false,
+                        message: 'Generation already in progress.'
+                    };
+                } else {
+                    // Run generation in background so we can return command success immediately
+                    // We need to pass the current chat length so it knows where to start tracking context
+                    const startIndex = SillyTavern.getContext().chat.length;
+                    setupAndRunGeneration(chatId, botId, data.characterName, startIndex);
+                    
+                    result = {
+                        success: true,
+                        message: 'Generation triggered.'
+                    };
+                }
+                break;
+
             default:
                 // Handle numbered commands (switchchat_N)
                 const chatMatch = data.command.match(/^switchchat_(\d+)$/);
@@ -721,21 +762,14 @@ async function handleExecuteCommand(data) {
 }
 
 /**
- * Handles user message generation requests
- * @param {Object} data - Message data from server
+ * Common logic to setup and run the generation process
+ * Used by both handleUserMessage and trigger_generation command
+ * @param {number} chatId - Telegram chat ID
+ * @param {string} botId - Bot identifier
+ * @param {string} characterName - Character being used
+ * @param {number} startMessageIndex - Chat index when request started
  */
-async function handleUserMessage(data) {
-    log('log', 'Received user message for generation', data);
-    log('log', `Message has ${data.files?.length || 0} file attachment(s)`);
-
-    const chatId = data.chatId;
-    const botId = data.botId;
-    const characterName = data.characterName;
-
-    // Get current chat length to track new messages
-    let context = SillyTavern.getContext();
-    const startMessageIndex = context.chat.length;
-
+async function setupAndRunGeneration(chatId, botId, characterName, startMessageIndex) {
     // Set up active request tracking
     activeRequest = {
         chatId: chatId,
@@ -748,61 +782,6 @@ async function handleUserMessage(data) {
 
     // Send typing indicator
     sendToServer({ type: 'typing_action', chatId, botId });
-
-    // Process file attachments if present
-    let fileExtras = null;
-    if (data.files && data.files.length > 0) {
-        log('log', `Processing ${data.files.length} file attachment(s)...`);
-        const uploadedFiles = await processFileAttachments(data.files);
-        if (uploadedFiles.length > 0) {
-            fileExtras = buildFileExtras(uploadedFiles);
-        }
-    }
-
-    // Add user message to SillyTavern
-    await sendMessageAsUser(data.text);
-
-    // If we have file attachments, add them to the user message we just created
-    if (fileExtras) {
-        // Refresh context to get the updated chat
-        context = SillyTavern.getContext();
-        const userMessageIndex = context.chat.length - 1;
-        const userMessage = context.chat[userMessageIndex];
-        
-        if (userMessage && userMessage.is_user) {
-            log('log', `Attaching file extras to user message at index ${userMessageIndex}`);
-            
-            // Merge file extras into the message's extra object
-            userMessage.extra = userMessage.extra || {};
-            Object.assign(userMessage.extra, fileExtras);
-            
-            log('log', `User message extra after merge:`, JSON.stringify(userMessage.extra, null, 2));
-            
-            // Render the media in the UI
-            try {
-                const messageElement = $(`#chat .mes[mesid="${userMessageIndex}"]`);
-                if (messageElement.length > 0) {
-                    appendMediaToMessage(userMessage, messageElement, false);
-                    log('log', `Media rendered in UI for message ${userMessageIndex}`);
-                } else {
-                    log('warn', `Could not find message element for index ${userMessageIndex}`);
-                }
-            } catch (renderError) {
-                log('error', `Failed to render media: ${renderError.message}`);
-            }
-            
-            // Save the chat to persist the changes
-            try {
-                const { saveChatConditional } = await import("../../../../script.js");
-                await saveChatConditional();
-                log('log', `Chat saved with file attachments`);
-            } catch (saveError) {
-                log('error', `Failed to save chat: ${saveError.message}`);
-            }
-        } else {
-            log('warn', `Could not find user message to attach files. Index: ${userMessageIndex}, is_user: ${userMessage?.is_user}`);
-        }
-    }
 
     // Set up streaming callback
     const streamCallback = (cumulativeText) => {
@@ -879,6 +858,81 @@ async function handleUserMessage(data) {
         cleanup();
         activeRequest = null;
     }
+}
+
+/**
+ * Handles user message generation requests
+ * @param {Object} data - Message data from server
+ */
+async function handleUserMessage(data) {
+    log('log', 'Received user message for generation', data);
+    log('log', `Message has ${data.files?.length || 0} file attachment(s)`);
+
+    const chatId = data.chatId;
+    const botId = data.botId;
+    const characterName = data.characterName;
+
+    // Get current chat length to track new messages
+    let context = SillyTavern.getContext();
+    const startMessageIndex = context.chat.length;
+
+    // Process file attachments if present
+    let fileExtras = null;
+    if (data.files && data.files.length > 0) {
+        log('log', `Processing ${data.files.length} file attachment(s)...`);
+        const uploadedFiles = await processFileAttachments(data.files);
+        if (uploadedFiles.length > 0) {
+            fileExtras = buildFileExtras(uploadedFiles);
+        }
+    }
+
+    // Add user message to SillyTavern
+    await sendMessageAsUser(data.text);
+
+    // If we have file attachments, add them to the user message we just created
+    if (fileExtras) {
+        // Refresh context to get the updated chat
+        context = SillyTavern.getContext();
+        const userMessageIndex = context.chat.length - 1;
+        const userMessage = context.chat[userMessageIndex];
+        
+        if (userMessage && userMessage.is_user) {
+            log('log', `Attaching file extras to user message at index ${userMessageIndex}`);
+            
+            // Merge file extras into the message's extra object
+            userMessage.extra = userMessage.extra || {};
+            Object.assign(userMessage.extra, fileExtras);
+            
+            log('log', `User message extra after merge:`, JSON.stringify(userMessage.extra, null, 2));
+            
+            // Render the media in the UI
+            try {
+                const messageElement = $(`#chat .mes[mesid="${userMessageIndex}"]`);
+                if (messageElement.length > 0) {
+                    appendMediaToMessage(userMessage, messageElement, false);
+                    log('log', `Media rendered in UI for message ${userMessageIndex}`);
+                } else {
+                    log('warn', `Could not find message element for index ${userMessageIndex}`);
+                }
+            } catch (renderError) {
+                log('error', `Failed to render media: ${renderError.message}`);
+            }
+            
+            // Save the chat to persist the changes
+            try {
+                const { saveChatConditional } = await import("../../../../script.js");
+                await saveChatConditional();
+                log('log', `Chat saved with file attachments`);
+            } catch (saveError) {
+                log('error', `Failed to save chat: ${saveError.message}`);
+            }
+        } else {
+            log('warn', `Could not find user message to attach files. Index: ${userMessageIndex}, is_user: ${userMessage?.is_user}`);
+        }
+    }
+
+    // Set up active request tracking and trigger generation
+    await setupAndRunGeneration(chatId, botId, characterName, startMessageIndex);
 }
 
 // ============================================================================

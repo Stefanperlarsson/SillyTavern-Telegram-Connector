@@ -729,6 +729,8 @@ Chat Management
 /listchats - List all saved chat logs for ${managedBot.characterName}
 /switchchat <name> - Load a specific chat log
 /switchchat_<N> - Load chat log by number
+/delete [n] - Delete the last n messages (default 1)
+/trigger - Manually trigger a new AI response
 
 System Management
 /reload - Reload server configuration
@@ -762,6 +764,49 @@ Note: This bot is dedicated to ${managedBot.characterName}. Messages you send wi
             timestamp: 0
         };
 
+        enqueueJob(job);
+        return;
+    }
+
+    // Delete/Undo commands
+    if (['delete'].includes(command)) {
+        const count = args.length > 0 ? parseInt(args[0]) : 1;
+        if (isNaN(count) || count < 1) {
+            managedBot.instance.sendMessage(chatId, 'Invalid number of messages to delete.')
+                .catch(err => logWithTimestamp('error', 'Failed to send error message:', err.message));
+            return;
+        }
+
+        const job = {
+            id: '',
+            bot: managedBot,
+            chatId: chatId,
+            userId: msg.from.id,
+            text: '',
+            targetCharacter: managedBot.characterName,
+            type: 'command',
+            command: 'delete_messages',
+            args: [count],
+            timestamp: 0
+        };
+        enqueueJob(job);
+        return;
+    }
+
+    // Trigger/Regenerate commands
+    if (['trigger'].includes(command)) {
+        const job = {
+            id: '',
+            bot: managedBot,
+            chatId: chatId,
+            userId: msg.from.id,
+            text: '',
+            targetCharacter: managedBot.characterName,
+            type: 'command',
+            command: 'trigger_generation',
+            args: [],
+            timestamp: 0
+        };
         enqueueJob(job);
         return;
     }
