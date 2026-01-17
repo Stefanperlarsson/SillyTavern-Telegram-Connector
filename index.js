@@ -22,6 +22,7 @@ import {
     Generate,
     setExternalAbortController,
     appendMediaToMessage,
+    executeSlashCommands,
 } from "../../../../script.js";
 
 // Import utility functions for file handling
@@ -693,6 +694,34 @@ async function handleExecuteCommand(data) {
                         success: true,
                         message: 'Generation triggered.'
                     };
+                }
+                break;
+
+            // --- Switch Model/Profile ---
+            case 'switchmodel':
+                if (!data.args || data.args.length === 0) {
+                    result = {
+                        success: false,
+                        message: 'No model profile provided.'
+                    };
+                } else {
+                    const profileName = data.args.join(' ');
+                    try {
+                        log('log', `Switching to profile via slash command: /profile ${profileName}`);
+                        // Execute the slash command to switch profile
+                        // We use the slash command because it handles all the UI/backend updates
+                        await executeSlashCommands(`/profile ${profileName}`);
+                        result = {
+                            success: true,
+                            message: `Switched to profile: ${profileName}`
+                        };
+                    } catch (err) {
+                        log('error', `Failed to switch to profile "${profileName}":`, err);
+                        result = {
+                            success: false,
+                            message: `Failed to switch to profile "${profileName}".`
+                        };
+                    }
                 }
                 break;
 
