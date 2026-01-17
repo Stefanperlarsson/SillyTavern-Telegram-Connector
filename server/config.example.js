@@ -21,7 +21,11 @@ module.exports = {
             // Telegram Bot Token (get from @BotFather)
             token: 'YOUR_FIRST_BOT_TOKEN_HERE',
             // Exact name of the SillyTavern character this bot represents
-            characterName: 'Character Name Here'
+            characterName: 'Character Name Here',
+            // Optional: Name of the Connection Profile to use for this character
+            // This allows you to use different backends/models for different characters.
+            // The profile must exist in SillyTavern.
+            // connectionProfile: 'My GPT-4 Profile'
         },
         // Add more bots as needed:
         // {

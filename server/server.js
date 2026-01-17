@@ -16,6 +16,7 @@ const path = require('path');
  * @typedef {Object} BotConfig
  * @property {string} token - Telegram Bot API token
  * @property {string} characterName - Exact name of the SillyTavern character
+ * @property {string} [connectionProfile] - Optional connection profile name
  */
 
 /**
@@ -24,6 +25,7 @@ const path = require('path');
  * @property {TelegramBot} instance - The node-telegram-bot-api instance
  * @property {string} characterName - The character this bot represents
  * @property {string} token - The bot's token (for restart notifications)
+ * @property {string} [connectionProfile] - The connection profile to use
  */
 
 /**
@@ -271,7 +273,12 @@ async function processQueue() {
         // Step 1: Switch character (and wait for confirmation)
         await switchCharacterAndWait(job);
 
-        // Step 2: If character switch succeeded, process the actual request
+        // Step 2: Switch model/connection profile if configured
+        if (activeJob && activeJob.characterSwitched) {
+            await switchModelAndWait(job);
+        }
+
+        // Step 3: If switches succeeded, process the actual request
         if (activeJob && activeJob.characterSwitched) {
             if (job.type === 'message') {
                 await sendUserMessage(job);
@@ -318,6 +325,45 @@ function switchCharacterAndWait(job) {
             chatId: job.chatId,
             botId: job.bot.id,
             isQueuedSwitch: true // Flag to indicate this is part of queue processing
+        }));
+    });
+}
+
+/**
+ * Sends the switchmodel command and waits for confirmation from the extension
+ * @param {QueueJob} job - The current job
+ * @returns {Promise<void>}
+ */
+function switchModelAndWait(job) {
+    // If no model configured, resolve immediately
+    if (!job.bot.connectionProfile) {
+        return Promise.resolve();
+    }
+
+    return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+            reject(new Error(`Model switch to "${job.bot.connectionProfile}" timed out`));
+        }, 15000); // 15 seconds timeout for model switch
+
+        // Re-use activeJob.switchResolve/Reject but for model
+        // We know character switch is done, so we can overwrite these handlers
+        activeJob.switchResolve = () => {
+            clearTimeout(timeout);
+            resolve();
+        };
+        activeJob.switchReject = (error) => {
+            clearTimeout(timeout);
+            reject(error);
+        };
+
+        logWithTimestamp('log', `Requesting model switch to "${job.bot.connectionProfile}"`);
+        sillyTavernClient.send(JSON.stringify({
+            type: 'execute_command',
+            command: 'switchmodel',
+            args: [job.bot.connectionProfile],
+            chatId: job.chatId,
+            botId: job.bot.id,
+            isQueuedSwitch: true // Use same flag to indicate it's a blocking background op
         }));
     });
 }
@@ -475,7 +521,8 @@ async function initializeBots() {
             id: botId,
             instance: bot,
             characterName: botConfig.characterName,
-            token: botConfig.token
+            token: botConfig.token,
+            connectionProfile: botConfig.connectionProfile
         };
 
         managedBots.set(botId, managedBot);
@@ -1068,21 +1115,25 @@ wss.on('connection', ws => {
             data = JSON.parse(message);
 
             // --- Handle character switch confirmation ---
-            // Check for isQueuedSwitch flag OR switchchar command when we have a pending switch
-            const isPendingSwitch = activeJob && activeJob.switchResolve && !activeJob.characterSwitched;
-            const isSwitchResponse = data.isQueuedSwitch || (isPendingSwitch && data.command === 'switchchar');
+            // Check for isQueuedSwitch flag OR switchchar/switchmodel command when we have a pending switch
+            const isPendingSwitch = activeJob && activeJob.switchResolve;
+            const isSwitchResponse = data.isQueuedSwitch || (isPendingSwitch && (data.command === 'switchchar' || data.command === 'switchmodel'));
             
             if (data.type === 'command_executed' && isSwitchResponse) {
                 if (activeJob && activeJob.switchResolve) {
                     if (data.success) {
-                        logWithTimestamp('log', `Character switch to "${data.characterName || 'unknown'}" confirmed`);
+                        logWithTimestamp('log', `Command "${data.command}" successful`);
+                        // Only set characterSwitched if it was indeed a character switch
+                        if (data.command === 'switchchar') {
+                            activeJob.characterSwitched = true;
+                        }
                         activeJob.switchResolve();
                     } else {
-                        logWithTimestamp('error', `Character switch failed: ${data.message}`);
+                        logWithTimestamp('error', `Command "${data.command}" failed: ${data.message}`);
                         // Notify user of failure
-                        activeJob.job.bot.instance.sendMessage(activeJob.job.chatId, `Failed to switch character: ${data.message}`)
+                        activeJob.job.bot.instance.sendMessage(activeJob.job.chatId, `Failed to execute ${data.command}: ${data.message}`)
                             .catch(err => logWithTimestamp('error', 'Failed to send switch error:', err.message));
-                        activeJob.switchReject(new Error(data.message || 'Character switch failed'));
+                        activeJob.switchReject(new Error(data.message || 'Switch failed'));
                         releaseJob();
                     }
                 }
