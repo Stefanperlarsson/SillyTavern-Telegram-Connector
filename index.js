@@ -26,7 +26,7 @@ import {
 // Import utility functions for file handling
 import {
     saveBase64AsFile,
-} from "../../../../utils.js";
+} from "../../../utils.js";
 
 // ============================================================================
 // CONSTANTS & CONFIGURATION
