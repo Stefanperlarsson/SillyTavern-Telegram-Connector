@@ -1074,6 +1074,19 @@ async function handleFinalMessage(lastMessageIdInChatArray) {
 eventSource.on(event_types.GENERATION_ENDED, handleFinalMessage);
 eventSource.on(event_types.GENERATION_STOPPED, handleFinalMessage);
 
+// Register event listener for image generation start
+eventSource.on('sd_prompt_processing', () => {
+    if (activeRequest) {
+        log('log', 'Image generation started, sending chat action to server');
+        sendToServer({
+            type: 'chat_action',
+            chatId: activeRequest.chatId,
+            botId: activeRequest.botId,
+            action: 'upload_photo'
+        });
+    }
+});
+
 // ============================================================================
 // EXTENSION INITIALIZATION
 // ============================================================================
