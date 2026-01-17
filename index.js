@@ -21,7 +21,13 @@ import {
     openCharacterChat,
     Generate,
     setExternalAbortController,
+    appendMediaToMessage,
 } from "../../../../script.js";
+
+// Import utility functions for file handling
+import {
+    saveBase64AsFile,
+} from "../../../utils.js";
 
 // ============================================================================
 // CONSTANTS & CONFIGURATION
@@ -41,11 +47,20 @@ const DEFAULT_SETTINGS = {
 let ws = null;
 
 /**
+ * @typedef {Object} MediaItem
+ * @property {string} type - Media type ('image', 'video', 'audio')
+ * @property {string} url - Media URL (relative path or base64)
+ * @property {string} [title] - Optional title/prompt
+ */
+
+/**
  * @typedef {Object} ActiveRequest
  * @property {number} chatId - Telegram chat ID
  * @property {string} botId - Bot identifier
  * @property {string} characterName - Character being used
  * @property {boolean} isStreaming - Whether streaming is active
+ * @property {number} startMessageIndex - Chat index when request started
+ * @property {MediaItem[]} collectedMedia - Media collected during this request
  */
 
 /** @type {ActiveRequest|null} */
@@ -103,6 +118,237 @@ function log(level, ...args) {
         default:
             console.log(prefix, ...args);
     }
+}
+
+// ============================================================================
+// IMAGE HANDLING
+// ============================================================================
+
+/**
+ * Fetches an image from a URL and converts it to base64
+ * @param {string} imageUrl - The image URL (relative or absolute)
+ * @returns {Promise<{base64: string, mimeType: string}|null>} Base64 data or null on error
+ */
+async function fetchImageAsBase64(imageUrl) {
+    try {
+        // Handle relative URLs by prepending the origin
+        const fullUrl = imageUrl.startsWith('/') 
+            ? `${window.location.origin}${imageUrl}` 
+            : imageUrl;
+        
+        log('log', `Fetching image from: ${fullUrl}`);
+        
+        const response = await fetch(fullUrl);
+        if (!response.ok) {
+            log('error', `Failed to fetch image: ${response.status} ${response.statusText}`);
+            return null;
+        }
+        
+        const blob = await response.blob();
+        const mimeType = blob.type || 'image/png';
+        
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onloadend = () => {
+                // reader.result is "data:image/png;base64,xxxxx"
+                // Extract just the base64 part
+                const base64Data = reader.result.split(',')[1];
+                resolve({ base64: base64Data, mimeType: mimeType });
+            };
+            reader.onerror = reject;
+            reader.readAsDataURL(blob);
+        });
+    } catch (error) {
+        log('error', `Error fetching image: ${error.message}`);
+        return null;
+    }
+}
+
+/**
+ * Scans messages created during the current request for media
+ * @param {number} startIndex - Index to start scanning from
+ * @param {number} endIndex - Index to stop scanning at (exclusive)
+ * @returns {MediaItem[]} Array of media items found
+ */
+function scanMessagesForMedia(startIndex, endIndex) {
+    const context = SillyTavern.getContext();
+    const mediaItems = [];
+    
+    log('log', `scanMessagesForMedia: checking messages ${startIndex} to ${endIndex - 1}`);
+    
+    for (let i = startIndex; i < endIndex; i++) {
+        const msg = context.chat[i];
+        
+        // Skip user messages - we don't want to send user's own images back to them
+        if (msg?.is_user) {
+            log('log', `  Message ${i}: skipping (is_user=true)`);
+            continue;
+        }
+        
+        const hasMedia = msg?.extra?.media?.length > 0;
+        log('log', `  Message ${i}: hasMedia=${hasMedia}, is_user=${msg?.is_user}, is_system=${msg?.is_system}`);
+        
+        if (hasMedia) {
+            for (const media of msg.extra.media) {
+                log('log', `    Media found: type=${media.type}, hasUrl=${!!media.url}, urlLen=${media.url?.length}`);
+                if (media.type === 'image' && media.url) {
+                    mediaItems.push({
+                        type: media.type,
+                        url: media.url,
+                        title: media.title || ''
+                    });
+                    log('log', `    -> Added to mediaItems`);
+                }
+            }
+        }
+    }
+    
+    log('log', `scanMessagesForMedia: returning ${mediaItems.length} items`);
+    return mediaItems;
+}
+
+/**
+ * @typedef {Object} UploadedFile
+ * @property {string} url - URL path to the uploaded file
+ * @property {string} type - 'image' | 'video' | 'audio' | 'file'
+ * @property {string} fileName - Original file name
+ * @property {string} mimeType - MIME type
+ */
+
+/**
+ * Processes file attachments from Telegram and uploads them to SillyTavern
+ * @param {Array<{base64: string, mimeType: string, fileName: string}>} files - Files from Telegram
+ * @returns {Promise<UploadedFile[]>} Array of uploaded file info
+ */
+async function processFileAttachments(files) {
+    const uploaded = [];
+    
+    log('log', `Processing ${files.length} file attachment(s) from Telegram`);
+    
+    for (const file of files) {
+        try {
+            log('log', `Uploading file: ${file.fileName} (${file.mimeType}), base64 length: ${file.base64.length}`);
+            
+            // Determine file type category
+            const isImage = file.mimeType.startsWith('image/');
+            const isVideo = file.mimeType.startsWith('video/');
+            const isAudio = file.mimeType.startsWith('audio/');
+            
+            // Get file extension from filename or mime type
+            let ext = file.fileName.includes('.') 
+                ? file.fileName.split('.').pop() 
+                : null;
+            
+            // Fallback extension from mime type
+            if (!ext) {
+                const mimeExtMap = {
+                    'image/jpeg': 'jpg',
+                    'image/png': 'png',
+                    'image/gif': 'gif',
+                    'image/webp': 'webp',
+                    'video/mp4': 'mp4',
+                    'video/webm': 'webm',
+                    'audio/mpeg': 'mp3',
+                    'audio/ogg': 'ogg',
+                    'audio/wav': 'wav',
+                };
+                ext = mimeExtMap[file.mimeType] || 'bin';
+            }
+            
+            log('log', `File type: ${isImage ? 'image' : isVideo ? 'video' : isAudio ? 'audio' : 'file'}, extension: ${ext}`);
+            
+            // Upload to SillyTavern server using saveBase64AsFile
+            // Parameters: (base64Data, uniqueId, prefix, extension)
+            // Use timestamp + random string to ensure unique filenames
+            const uniqueId = `${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+            const url = await saveBase64AsFile(file.base64, uniqueId, 'telegram', ext);
+            
+            log('log', `File uploaded successfully: ${url}`);
+            
+            uploaded.push({
+                url: url,
+                type: isImage ? 'image' : isVideo ? 'video' : isAudio ? 'audio' : 'file',
+                fileName: file.fileName,
+                mimeType: file.mimeType,
+            });
+        } catch (error) {
+            log('error', `Failed to upload file ${file.fileName}: ${error.message}`);
+        }
+    }
+    
+    log('log', `Successfully uploaded ${uploaded.length}/${files.length} files`);
+    return uploaded;
+}
+
+/**
+ * Builds the extra object for a user message with file attachments
+ * @param {UploadedFile[]} uploadedFiles - Array of uploaded file info
+ * @returns {Object} Extra object to merge into message
+ */
+function buildFileExtras(uploadedFiles) {
+    const extras = {};
+    
+    // Separate files by type
+    const images = uploadedFiles.filter(f => f.type === 'image');
+    const videos = uploadedFiles.filter(f => f.type === 'video');
+    const audios = uploadedFiles.filter(f => f.type === 'audio');
+    const otherFiles = uploadedFiles.filter(f => f.type === 'file');
+    
+    log('log', `Building extras: ${images.length} images, ${videos.length} videos, ${audios.length} audio, ${otherFiles.length} other`);
+    
+    // Always use media array for images (ST rejects extra.image, requires extra.media)
+    if (images.length > 0) {
+        extras.media = images.map(img => ({
+            url: img.url,
+            type: 'image',
+            title: '',
+        }));
+        log('log', `Set ${images.length} image(s) via media array`);
+    }
+    
+    // Add videos to media array
+    if (videos.length > 0) {
+        const videoMedia = videos.map(v => ({
+            url: v.url,
+            type: 'video',
+            title: '',
+        }));
+        extras.media = (extras.media || []).concat(videoMedia);
+        log('log', `Added ${videos.length} video(s) to media array`);
+    }
+    
+    // Add audio files to media array
+    if (audios.length > 0) {
+        const audioMedia = audios.map(a => ({
+            url: a.url,
+            type: 'audio',
+            title: '',
+        }));
+        extras.media = (extras.media || []).concat(audioMedia);
+        log('log', `Added ${audios.length} audio file(s) to media array`);
+    }
+    
+    // For other files - ST uses extra.file for single file attachment
+    if (otherFiles.length === 1) {
+        extras.file = {
+            url: otherFiles[0].url,
+            name: otherFiles[0].fileName,
+            size: 0, // We don't have the exact size, but ST may not require it
+        };
+        log('log', `Set single file attachment: ${otherFiles[0].fileName}`);
+    } else if (otherFiles.length > 1) {
+        // For multiple files, we might need a different approach
+        // For now, only attach the first one and log a warning
+        extras.file = {
+            url: otherFiles[0].url,
+            name: otherFiles[0].fileName,
+            size: 0,
+        };
+        log('warn', `Multiple non-media files received, only attaching the first: ${otherFiles[0].fileName}`);
+    }
+    
+    log('log', `Built extras object:`, JSON.stringify(extras, null, 2));
+    return extras;
 }
 
 // ============================================================================
@@ -336,6 +582,19 @@ async function handleExecuteCommand(data) {
 
     try {
         switch (data.command) {
+            // --- Character Switch (queued) ---
+            case 'switchchar':
+                if (data.args && data.args.length > 0) {
+                    const targetName = data.args.join(' ');
+                    result = await switchToCharacter(targetName, chatId, botId, isQueuedSwitch);
+                } else {
+                    result = {
+                        success: false,
+                        message: 'No character name provided.'
+                    };
+                }
+                break;
+
             // --- New Chat ---
             case 'new':
                 await doNewChat({ deleteCurrentChat: false });
@@ -393,6 +652,47 @@ async function handleExecuteCommand(data) {
                             message: `Failed to load chat log "${targetChatFile}".`
                         };
                     }
+                }
+                break;
+
+            // --- Delete Messages ---
+            case 'delete_messages':
+                const count = data.args && data.args.length > 0 ? parseInt(data.args[0]) : 1;
+                let deleted = 0;
+                for (let i = 0; i < count; i++) {
+                    // Safety check: don't delete if chat is empty
+                    if (SillyTavern.getContext().chat.length === 0) break;
+                    try {
+                        await deleteLastMessage();
+                        deleted++;
+                    } catch (e) {
+                        log('error', 'Failed to delete message:', e);
+                        break;
+                    }
+                }
+                result = {
+                    success: true,
+                    message: `Deleted ${deleted} message(s).`
+                };
+                break;
+
+            // --- Trigger Generation ---
+            case 'trigger_generation':
+                if (activeRequest) {
+                     result = {
+                        success: false,
+                        message: 'Generation already in progress.'
+                    };
+                } else {
+                    // Run generation in background so we can return command success immediately
+                    // We need to pass the current chat length so it knows where to start tracking context
+                    const startIndex = SillyTavern.getContext().chat.length;
+                    setupAndRunGeneration(chatId, botId, data.characterName, startIndex);
+                    
+                    result = {
+                        success: true,
+                        message: 'Generation triggered.'
+                    };
                 }
                 break;
 
@@ -462,29 +762,26 @@ async function handleExecuteCommand(data) {
 }
 
 /**
- * Handles user message generation requests
- * @param {Object} data - Message data from server
+ * Common logic to setup and run the generation process
+ * Used by both handleUserMessage and trigger_generation command
+ * @param {number} chatId - Telegram chat ID
+ * @param {string} botId - Bot identifier
+ * @param {string} characterName - Character being used
+ * @param {number} startMessageIndex - Chat index when request started
  */
-async function handleUserMessage(data) {
-    log('log', 'Received user message for generation', data);
-
-    const chatId = data.chatId;
-    const botId = data.botId;
-    const characterName = data.characterName;
-
+async function setupAndRunGeneration(chatId, botId, characterName, startMessageIndex) {
     // Set up active request tracking
     activeRequest = {
         chatId: chatId,
         botId: botId,
         characterName: characterName,
-        isStreaming: false
+        isStreaming: false,
+        startMessageIndex: startMessageIndex,
+        collectedMedia: []
     };
 
     // Send typing indicator
     sendToServer({ type: 'typing_action', chatId, botId });
-
-    // Add user message to SillyTavern
-    await sendMessageAsUser(data.text);
 
     // Set up streaming callback
     const streamCallback = (cumulativeText) => {
@@ -528,9 +825,23 @@ async function handleUserMessage(data) {
         log('error', 'Generate() error:', error);
         errorOccurred = true;
 
-        // Delete the user message that caused the error
-        await deleteLastMessage();
-        log('log', 'Deleted user message that caused the error.');
+        // Delete all messages created since the request started
+        // This includes: user message, any tool call messages, failed AI responses
+        const currentContext = SillyTavern.getContext();
+        const messagesToDelete = currentContext.chat.length - startMessageIndex;
+        
+        log('log', `Cleaning up ${messagesToDelete} messages (from index ${startMessageIndex} to ${currentContext.chat.length - 1})`);
+        
+        // Delete messages in reverse order (newest first)
+        for (let i = 0; i < messagesToDelete; i++) {
+            try {
+                await deleteLastMessage();
+                log('log', `Deleted message ${i + 1}/${messagesToDelete}`);
+            } catch (deleteError) {
+                log('error', `Failed to delete message: ${deleteError.message}`);
+                break; // Stop if deletion fails
+            }
+        }
 
         // Send error message
         const errorMessage = `Sorry, an error occurred while generating a reply.\nYour previous message has been retracted, please retry or send different content.\n\nError details: ${error.message || 'Unknown error'}`;
@@ -549,6 +860,81 @@ async function handleUserMessage(data) {
     }
 }
 
+/**
+ * Handles user message generation requests
+ * @param {Object} data - Message data from server
+ */
+async function handleUserMessage(data) {
+    log('log', 'Received user message for generation', data);
+    log('log', `Message has ${data.files?.length || 0} file attachment(s)`);
+
+    const chatId = data.chatId;
+    const botId = data.botId;
+    const characterName = data.characterName;
+
+    // Get current chat length to track new messages
+    let context = SillyTavern.getContext();
+    const startMessageIndex = context.chat.length;
+
+    // Process file attachments if present
+    let fileExtras = null;
+    if (data.files && data.files.length > 0) {
+        log('log', `Processing ${data.files.length} file attachment(s)...`);
+        const uploadedFiles = await processFileAttachments(data.files);
+        if (uploadedFiles.length > 0) {
+            fileExtras = buildFileExtras(uploadedFiles);
+        }
+    }
+
+    // Add user message to SillyTavern
+    await sendMessageAsUser(data.text);
+
+    // If we have file attachments, add them to the user message we just created
+    if (fileExtras) {
+        // Refresh context to get the updated chat
+        context = SillyTavern.getContext();
+        const userMessageIndex = context.chat.length - 1;
+        const userMessage = context.chat[userMessageIndex];
+        
+        if (userMessage && userMessage.is_user) {
+            log('log', `Attaching file extras to user message at index ${userMessageIndex}`);
+            
+            // Merge file extras into the message's extra object
+            userMessage.extra = userMessage.extra || {};
+            Object.assign(userMessage.extra, fileExtras);
+            
+            log('log', `User message extra after merge:`, JSON.stringify(userMessage.extra, null, 2));
+            
+            // Render the media in the UI
+            try {
+                const messageElement = $(`#chat .mes[mesid="${userMessageIndex}"]`);
+                if (messageElement.length > 0) {
+                    appendMediaToMessage(userMessage, messageElement, false);
+                    log('log', `Media rendered in UI for message ${userMessageIndex}`);
+                } else {
+                    log('warn', `Could not find message element for index ${userMessageIndex}`);
+                }
+            } catch (renderError) {
+                log('error', `Failed to render media: ${renderError.message}`);
+            }
+            
+            // Save the chat to persist the changes
+            try {
+                const { saveChatConditional } = await import("../../../../script.js");
+                await saveChatConditional();
+                log('log', `Chat saved with file attachments`);
+            } catch (saveError) {
+                log('error', `Failed to save chat: ${saveError.message}`);
+            }
+        } else {
+            log('warn', `Could not find user message to attach files. Index: ${userMessageIndex}, is_user: ${userMessage?.is_user}`);
+        }
+    }
+
+    // Set up active request tracking and trigger generation
+    await setupAndRunGeneration(chatId, botId, characterName, startMessageIndex);
+}
+
 // ============================================================================
 // FINAL MESSAGE HANDLING
 // ============================================================================
@@ -558,7 +944,7 @@ async function handleUserMessage(data) {
  * Extracts rendered text from the DOM and sends it to the server
  * @param {number} lastMessageIdInChatArray - Index of the last message in the chat array
  */
-function handleFinalMessage(lastMessageIdInChatArray) {
+async function handleFinalMessage(lastMessageIdInChatArray) {
     log('log', `handleFinalMessage called with index: ${lastMessageIdInChatArray}, activeRequest:`, activeRequest);
     
     // Ensure we have an active request to respond to
@@ -571,51 +957,83 @@ function handleFinalMessage(lastMessageIdInChatArray) {
     if (lastMessageIndex < 0) return;
 
     // Small delay to ensure DOM update is complete
-    setTimeout(() => {
-        const context = SillyTavern.getContext();
-        const lastMessage = context.chat[lastMessageIndex];
+    await new Promise(resolve => setTimeout(resolve, 100));
+    
+    const context = SillyTavern.getContext();
+    const lastMessage = context.chat[lastMessageIndex];
 
-        // Confirm this is the AI reply we just triggered
-        if (lastMessage && !lastMessage.is_user && !lastMessage.is_system) {
-            const messageElement = $(`#chat .mes[mesid="${lastMessageIndex}"]`);
+    // Scan for media generated during this request
+    const startIdx = activeRequest.startMessageIndex || 0;
+    log('log', `Scanning for media from index ${startIdx} to ${context.chat.length - 1} (chat length: ${context.chat.length})`);
+    const mediaItems = scanMessagesForMedia(startIdx, context.chat.length);
+    log('log', `Found ${mediaItems.length} media items total`);
+    
+    // Debug: show what we found
+    if (mediaItems.length > 0) {
+        mediaItems.forEach((item, idx) => {
+            log('log', `  Media item ${idx}: type=${item.type}, url=${item.url?.substring(0, 50)}...`);
+        });
+    }
 
-            if (messageElement.length > 0) {
-                const messageTextElement = messageElement.find('.mes_text');
+    // Confirm this is the AI reply we just triggered
+    if (lastMessage && !lastMessage.is_user && !lastMessage.is_system) {
+        const messageElement = $(`#chat .mes[mesid="${lastMessageIndex}"]`);
 
-                // Get HTML content and convert to plain text
-                let renderedText = messageTextElement.html()
-                    .replace(/<br\s*\/?>/gi, '\n')
-                    .replace(/<\/p>\s*<p>/gi, '\n\n');
+        if (messageElement.length > 0) {
+            const messageTextElement = messageElement.find('.mes_text');
 
-                // Decode HTML entities
-                const tempDiv = document.createElement('div');
-                tempDiv.innerHTML = renderedText;
-                renderedText = tempDiv.textContent;
+            // Get HTML content and convert to plain text
+            let renderedText = messageTextElement.html()
+                .replace(/<br\s*\/?>/gi, '\n')
+                .replace(/<\/p>\s*<p>/gi, '\n\n');
 
-                log('log', `Sending final message to bot ${activeRequest.botId}`);
+            // Decode HTML entities
+            const tempDiv = document.createElement('div');
+            tempDiv.innerHTML = renderedText;
+            renderedText = tempDiv.textContent;
 
-                // Send appropriate message type based on streaming state
-                if (activeRequest.isStreaming) {
-                    sendToServer({
-                        type: 'final_message_update',
-                        chatId: activeRequest.chatId,
-                        botId: activeRequest.botId,
-                        text: renderedText,
-                    });
-                } else {
-                    sendToServer({
-                        type: 'ai_reply',
-                        chatId: activeRequest.chatId,
-                        botId: activeRequest.botId,
-                        text: renderedText,
-                    });
+            // Fetch and convert images to base64 for transmission
+            const images = [];
+            for (const media of mediaItems) {
+                if (media.type === 'image') {
+                    const imageData = await fetchImageAsBase64(media.url);
+                    if (imageData) {
+                        images.push({
+                            base64: imageData.base64,
+                            mimeType: imageData.mimeType,
+                        });
+                        log('log', `Prepared image for sending: ${imageData.mimeType}, ${imageData.base64.length} chars`);
+                    }
                 }
-
-                // Clear active request
-                activeRequest = null;
             }
+
+            log('log', `Sending final message to bot ${activeRequest.botId} with ${images.length} images`);
+
+            // Build the payload
+            const payload = {
+                chatId: activeRequest.chatId,
+                botId: activeRequest.botId,
+                text: renderedText,
+                images: images.length > 0 ? images : undefined,
+            };
+
+            // Send appropriate message type based on streaming state
+            if (activeRequest.isStreaming) {
+                sendToServer({
+                    type: 'final_message_update',
+                    ...payload,
+                });
+            } else {
+                sendToServer({
+                    type: 'ai_reply',
+                    ...payload,
+                });
+            }
+
+            // Clear active request
+            activeRequest = null;
         }
-    }, 100);
+    }
 }
 
 // Register global event listeners for final message handling

@@ -25,6 +25,7 @@ pids
 *.pid
 *.seed
 *.pid.lock
+server/.restart_protection
 
 # 目录
 dist/

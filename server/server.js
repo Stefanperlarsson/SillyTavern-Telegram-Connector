@@ -27,6 +27,13 @@ const path = require('path');
  */
 
 /**
+ * @typedef {Object} FileAttachment
+ * @property {string} fileId - Telegram file ID
+ * @property {string} fileName - Original file name
+ * @property {string} mimeType - MIME type of the file
+ */
+
+/**
  * @typedef {Object} QueueJob
  * @property {string} id - Unique job identifier
  * @property {ManagedBot} bot - The bot that received the message
@@ -37,6 +44,7 @@ const path = require('path');
  * @property {'message' | 'command'} type - Job type
  * @property {string} [command] - Command name (if type is 'command')
  * @property {string[]} [args] - Command arguments (if type is 'command')
+ * @property {FileAttachment[]} [files] - File attachments from Telegram
  * @property {number} timestamp - When the job was created
  */
 
@@ -325,14 +333,48 @@ async function sendUserMessage(job) {
     job.bot.instance.sendChatAction(job.chatId, 'typing')
         .catch(err => logWithTimestamp('error', 'Failed to send typing action:', err.message));
 
+    // Download any file attachments
+    let fileAttachments = undefined;
+    if (job.files && job.files.length > 0) {
+        logWithTimestamp('log', `Downloading ${job.files.length} file(s) from Telegram...`);
+        fileAttachments = [];
+        
+        for (const file of job.files) {
+            const downloaded = await downloadTelegramFile(
+                job.bot.instance,
+                file.fileId,
+                file.fileName,
+                file.mimeType
+            );
+            
+            if (downloaded) {
+                fileAttachments.push(downloaded);
+                logWithTimestamp('log', `Successfully downloaded: ${file.fileName}`);
+            } else {
+                logWithTimestamp('error', `Failed to download: ${file.fileName}`);
+            }
+        }
+        
+        logWithTimestamp('log', `Downloaded ${fileAttachments.length}/${job.files.length} files`);
+        
+        // Only include if we have files
+        if (fileAttachments.length === 0) {
+            fileAttachments = undefined;
+        }
+    }
+
     // Send the message to SillyTavern
-    sillyTavernClient.send(JSON.stringify({
+    const payload = {
         type: 'user_message',
         chatId: job.chatId,
         text: job.text,
         botId: job.bot.id,
-        characterName: job.targetCharacter
-    }));
+        characterName: job.targetCharacter,
+        files: fileAttachments,
+    };
+    
+    logWithTimestamp('log', `Sending to SillyTavern: text="${job.text.substring(0, 30)}...", files=${fileAttachments?.length || 0}`);
+    sillyTavernClient.send(JSON.stringify(payload));
 }
 
 /**
@@ -498,6 +540,73 @@ async function clearAndStartPollingAll() {
     }
 }
 
+// ============================================================================
+// MEDIA GROUP HANDLING
+// ============================================================================
+
+/**
+ * Pending media groups waiting to be combined
+ * Key: `${botId}_${chatId}_${mediaGroupId}`
+ * @type {Map<string, {messages: Array, timer: NodeJS.Timeout, bot: ManagedBot, chatId: number, userId: number}>}
+ */
+const pendingMediaGroups = new Map();
+
+/** Delay before processing a media group (ms) */
+const MEDIA_GROUP_DELAY = 500;
+
+/**
+ * Gets a unique key for a media group
+ * @param {string} botId - Bot identifier
+ * @param {number} chatId - Chat ID
+ * @param {string} mediaGroupId - Telegram media group ID
+ * @returns {string}
+ */
+function getMediaGroupKey(botId, chatId, mediaGroupId) {
+    return `${botId}_${chatId}_${mediaGroupId}`;
+}
+
+/**
+ * Processes a completed media group into a single job
+ * @param {string} groupKey - The media group key
+ */
+function processMediaGroup(groupKey) {
+    const group = pendingMediaGroups.get(groupKey);
+    if (!group) return;
+    
+    pendingMediaGroups.delete(groupKey);
+    
+    // Combine all files from all messages
+    const allFiles = [];
+    let caption = '';
+    
+    for (const msg of group.messages) {
+        const files = extractFileAttachments(msg);
+        allFiles.push(...files);
+        
+        // Use caption from first message that has one
+        if (!caption && msg.caption) {
+            caption = msg.caption;
+        }
+    }
+    
+    logWithTimestamp('log', `Processing media group: ${group.messages.length} messages, ${allFiles.length} files, caption="${caption.substring(0, 30)}..."`);
+    
+    // Create a single job with all files
+    const job = {
+        id: '',
+        bot: group.bot,
+        chatId: group.chatId,
+        userId: group.userId,
+        text: caption,
+        targetCharacter: group.bot.characterName,
+        type: 'message',
+        files: allFiles.length > 0 ? allFiles : undefined,
+        timestamp: 0
+    };
+    
+    enqueueJob(job);
+}
+
 /**
  * Sets up message and command handlers for a bot
  * @param {ManagedBot} managedBot - The managed bot instance
@@ -505,7 +614,6 @@ async function clearAndStartPollingAll() {
 function setupBotHandlers(managedBot) {
     managedBot.instance.on('message', (msg) => {
         const chatId = msg.chat.id;
-        const text = msg.text;
         const userId = msg.from.id;
         const username = msg.from.username || 'N/A';
 
@@ -519,10 +627,56 @@ function setupBotHandlers(managedBot) {
             }
         }
 
-        if (!text) return;
+        // Handle media groups (albums) - buffer and combine
+        if (msg.media_group_id) {
+            const groupKey = getMediaGroupKey(managedBot.id, chatId, msg.media_group_id);
+            
+            let group = pendingMediaGroups.get(groupKey);
+            if (!group) {
+                // First message in this media group
+                group = {
+                    messages: [],
+                    timer: null,
+                    bot: managedBot,
+                    chatId: chatId,
+                    userId: userId,
+                };
+                pendingMediaGroups.set(groupKey, group);
+                logWithTimestamp('log', `Started collecting media group: ${msg.media_group_id}`);
+            }
+            
+            // Add this message to the group
+            group.messages.push(msg);
+            logWithTimestamp('log', `Added message to media group ${msg.media_group_id}, total: ${group.messages.length}`);
+            
+            // Reset/set the timer - process after MEDIA_GROUP_DELAY ms of no new messages
+            if (group.timer) {
+                clearTimeout(group.timer);
+            }
+            group.timer = setTimeout(() => {
+                processMediaGroup(groupKey);
+            }, MEDIA_GROUP_DELAY);
+            
+            return; // Don't process individually
+        }
 
-        // Handle commands
-        if (text.startsWith('/')) {
+        // Extract text - use caption for media messages, otherwise use text
+        const text = msg.text || msg.caption || '';
+        
+        // Extract file attachments
+        const files = extractFileAttachments(msg);
+        
+        // Log what we received
+        logWithTimestamp('log', `Received message for "${managedBot.characterName}" from user ${userId}: text="${text.substring(0, 50)}${text.length > 50 ? '...' : ''}", files=${files.length}`);
+
+        // If no text and no files, ignore
+        if (!text && files.length === 0) {
+            logWithTimestamp('log', `Ignoring empty message (no text, no files)`);
+            return;
+        }
+
+        // Handle commands (only if it's a text-only message starting with /)
+        if (text.startsWith('/') && files.length === 0) {
             handleBotCommand(managedBot, msg);
             return;
         }
@@ -537,10 +691,10 @@ function setupBotHandlers(managedBot) {
             text: text,
             targetCharacter: managedBot.characterName,
             type: 'message',
+            files: files.length > 0 ? files : undefined,
             timestamp: 0 // Will be set by enqueueJob
         };
 
-        logWithTimestamp('log', `Received message for "${managedBot.characterName}" from user ${userId}: "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`);
         enqueueJob(job);
     });
 }
@@ -575,6 +729,8 @@ Chat Management
 /listchats - List all saved chat logs for ${managedBot.characterName}
 /switchchat <name> - Load a specific chat log
 /switchchat_<N> - Load chat log by number
+/delete [n] - Delete the last n messages (default 1)
+/trigger - Manually trigger a new AI response
 
 System Management
 /reload - Reload server configuration
@@ -608,6 +764,49 @@ Note: This bot is dedicated to ${managedBot.characterName}. Messages you send wi
             timestamp: 0
         };
 
+        enqueueJob(job);
+        return;
+    }
+
+    // Delete/Undo commands
+    if (['delete'].includes(command)) {
+        const count = args.length > 0 ? parseInt(args[0]) : 1;
+        if (isNaN(count) || count < 1) {
+            managedBot.instance.sendMessage(chatId, 'Invalid number of messages to delete.')
+                .catch(err => logWithTimestamp('error', 'Failed to send error message:', err.message));
+            return;
+        }
+
+        const job = {
+            id: '',
+            bot: managedBot,
+            chatId: chatId,
+            userId: msg.from.id,
+            text: '',
+            targetCharacter: managedBot.characterName,
+            type: 'command',
+            command: 'delete_messages',
+            args: [count],
+            timestamp: 0
+        };
+        enqueueJob(job);
+        return;
+    }
+
+    // Trigger/Regenerate commands
+    if (['trigger'].includes(command)) {
+        const job = {
+            id: '',
+            bot: managedBot,
+            chatId: chatId,
+            userId: msg.from.id,
+            text: '',
+            targetCharacter: managedBot.characterName,
+            type: 'command',
+            command: 'trigger_generation',
+            args: [],
+            timestamp: 0
+        };
         enqueueJob(job);
         return;
     }
@@ -672,6 +871,172 @@ function handleSystemCommand(command, chatId, managedBot) {
  * @type {Map<string, StreamSession>}
  */
 const ongoingStreams = new Map();
+
+// ============================================================================
+// IMAGE HANDLING
+// ============================================================================
+
+/**
+ * Sends images to a Telegram chat
+ * @param {ManagedBot} bot - The bot to send through
+ * @param {number} chatId - The chat ID to send to
+ * @param {Array<{base64: string, mimeType: string, caption?: string}>} images - Images to send
+ * @returns {Promise<void>}
+ */
+async function sendImagesToTelegram(bot, chatId, images) {
+    for (const image of images) {
+        try {
+            // Convert base64 to Buffer
+            const imageBuffer = Buffer.from(image.base64, 'base64');
+            
+            // Determine file extension from mime type
+            const extMap = {
+                'image/png': 'png',
+                'image/jpeg': 'jpg',
+                'image/jpg': 'jpg',
+                'image/gif': 'gif',
+                'image/webp': 'webp',
+            };
+            const ext = extMap[image.mimeType] || 'png';
+            
+            logWithTimestamp('log', `Sending image to Telegram: ${image.mimeType}, ${imageBuffer.length} bytes`);
+            
+            // Send the photo without caption (the prompt is not useful to show)
+            // Use fileOptions to specify content type and avoid deprecation warning
+            await bot.instance.sendPhoto(chatId, imageBuffer, {}, {
+                filename: `image.${ext}`,
+                contentType: image.mimeType,
+            });
+            
+            logWithTimestamp('log', `Image sent successfully`);
+        } catch (err) {
+            logWithTimestamp('error', `Failed to send image: ${err.message}`);
+        }
+    }
+}
+
+/**
+ * Downloads a file from Telegram and converts to base64
+ * @param {TelegramBot} botInstance - Bot instance
+ * @param {string} fileId - Telegram file ID
+ * @param {string} fileName - Original file name
+ * @param {string} mimeType - MIME type
+ * @returns {Promise<{base64: string, mimeType: string, fileName: string}|null>}
+ */
+async function downloadTelegramFile(botInstance, fileId, fileName, mimeType) {
+    try {
+        logWithTimestamp('log', `Downloading file from Telegram: ${fileName} (${mimeType})`);
+        
+        // Get file link from Telegram
+        const fileLink = await botInstance.getFileLink(fileId);
+        logWithTimestamp('log', `Got file link: ${fileLink}`);
+        
+        // Fetch the file
+        const response = await fetch(fileLink);
+        if (!response.ok) {
+            logWithTimestamp('error', `Failed to fetch file: ${response.status} ${response.statusText}`);
+            return null;
+        }
+        
+        // Get the buffer - need to handle both Node 18+ and older versions
+        const arrayBuffer = await response.arrayBuffer();
+        const buffer = Buffer.from(arrayBuffer);
+        
+        // Convert to base64
+        const base64 = buffer.toString('base64');
+        
+        logWithTimestamp('log', `Downloaded file: ${fileName}, size: ${buffer.length} bytes, base64 length: ${base64.length}`);
+        
+        return { base64, mimeType, fileName };
+    } catch (error) {
+        logWithTimestamp('error', `Error downloading file from Telegram: ${error.message}`);
+        return null;
+    }
+}
+
+/**
+ * Extracts file attachments from a Telegram message
+ * @param {Object} msg - Telegram message object
+ * @returns {FileAttachment[]} Array of file attachments
+ */
+function extractFileAttachments(msg) {
+    const files = [];
+    
+    // Photos - array of sizes, pick largest (last)
+    if (msg.photo && msg.photo.length > 0) {
+        const photo = msg.photo[msg.photo.length - 1];
+        files.push({
+            fileId: photo.file_id,
+            fileName: 'photo.jpg',
+            mimeType: 'image/jpeg'
+        });
+        logWithTimestamp('log', `Found photo attachment: ${photo.file_id}`);
+    }
+    
+    // Documents (generic files)
+    if (msg.document) {
+        files.push({
+            fileId: msg.document.file_id,
+            fileName: msg.document.file_name || 'document',
+            mimeType: msg.document.mime_type || 'application/octet-stream'
+        });
+        logWithTimestamp('log', `Found document attachment: ${msg.document.file_name} (${msg.document.mime_type})`);
+    }
+    
+    // Videos
+    if (msg.video) {
+        files.push({
+            fileId: msg.video.file_id,
+            fileName: msg.video.file_name || 'video.mp4',
+            mimeType: msg.video.mime_type || 'video/mp4'
+        });
+        logWithTimestamp('log', `Found video attachment: ${msg.video.file_name || 'video.mp4'}`);
+    }
+    
+    // Audio files
+    if (msg.audio) {
+        files.push({
+            fileId: msg.audio.file_id,
+            fileName: msg.audio.file_name || 'audio.mp3',
+            mimeType: msg.audio.mime_type || 'audio/mpeg'
+        });
+        logWithTimestamp('log', `Found audio attachment: ${msg.audio.file_name || 'audio.mp3'}`);
+    }
+    
+    // Voice messages
+    if (msg.voice) {
+        files.push({
+            fileId: msg.voice.file_id,
+            fileName: 'voice.ogg',
+            mimeType: msg.voice.mime_type || 'audio/ogg'
+        });
+        logWithTimestamp('log', `Found voice message attachment`);
+    }
+    
+    // Video notes (round video messages)
+    if (msg.video_note) {
+        files.push({
+            fileId: msg.video_note.file_id,
+            fileName: 'video_note.mp4',
+            mimeType: 'video/mp4'
+        });
+        logWithTimestamp('log', `Found video note attachment`);
+    }
+    
+    // Stickers
+    if (msg.sticker) {
+        const isAnimated = msg.sticker.is_animated;
+        const isVideo = msg.sticker.is_video;
+        files.push({
+            fileId: msg.sticker.file_id,
+            fileName: isVideo ? 'sticker.webm' : (isAnimated ? 'sticker.tgs' : 'sticker.webp'),
+            mimeType: isVideo ? 'video/webm' : (isAnimated ? 'application/x-tgsticker' : 'image/webp')
+        });
+        logWithTimestamp('log', `Found sticker attachment`);
+    }
+    
+    return files;
+}
 
 /**
  * Gets the stream key for a bot/chat combination
@@ -832,6 +1197,12 @@ wss.on('connection', ws => {
                     return;
                 }
 
+                // Send any images first (before the text message)
+                if (data.images && data.images.length > 0) {
+                    logWithTimestamp('log', `Sending ${data.images.length} image(s) to Telegram`);
+                    await sendImagesToTelegram(bot, data.chatId, data.images);
+                }
+
                 if (session) {
                     const messageId = await session.messagePromise;
                     if (messageId) {
@@ -864,6 +1235,12 @@ wss.on('connection', ws => {
                 if (!bot) {
                     logWithTimestamp('error', `Received ai_reply for unknown bot: ${data.botId}`);
                     return;
+                }
+
+                // Send any images first (before the text message)
+                if (data.images && data.images.length > 0) {
+                    logWithTimestamp('log', `Sending ${data.images.length} image(s) to Telegram`);
+                    await sendImagesToTelegram(bot, data.chatId, data.images);
                 }
 
                 logWithTimestamp('log', `Sending non-streaming AI reply`);
