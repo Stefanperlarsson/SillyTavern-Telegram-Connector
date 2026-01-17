@@ -288,37 +288,28 @@ function buildFileExtras(uploadedFiles) {
     
     log('log', `Building extras: ${images.length} images, ${videos.length} videos, ${audios.length} audio, ${otherFiles.length} other`);
     
-    // For images - ST can handle single image via extra.image or multiple via extra.media
-    if (images.length === 1) {
-        extras.image = images[0].url;
-        extras.inline_image = true;
-        log('log', `Set single image: ${images[0].url}`);
-    } else if (images.length > 1) {
-        // Use media array for multiple images
+    // Always use media array for images (ST rejects extra.image, requires extra.media)
+    if (images.length > 0) {
         extras.media = images.map(img => ({
             url: img.url,
             type: 'image',
             title: '',
         }));
-        log('log', `Set ${images.length} images via media array`);
+        log('log', `Set ${images.length} image(s) via media array`);
     }
     
-    // For single video
-    if (videos.length === 1) {
-        extras.video = videos[0].url;
-        log('log', `Set single video: ${videos[0].url}`);
-    } else if (videos.length > 1) {
-        // Add videos to media array
+    // Add videos to media array
+    if (videos.length > 0) {
         const videoMedia = videos.map(v => ({
             url: v.url,
             type: 'video',
             title: '',
         }));
         extras.media = (extras.media || []).concat(videoMedia);
-        log('log', `Added ${videos.length} videos to media array`);
+        log('log', `Added ${videos.length} video(s) to media array`);
     }
     
-    // For audio files - add to media array
+    // Add audio files to media array
     if (audios.length > 0) {
         const audioMedia = audios.map(a => ({
             url: a.url,
@@ -326,7 +317,7 @@ function buildFileExtras(uploadedFiles) {
             title: '',
         }));
         extras.media = (extras.media || []).concat(audioMedia);
-        log('log', `Added ${audios.length} audio files to media array`);
+        log('log', `Added ${audios.length} audio file(s) to media array`);
     }
     
     // For other files - ST uses extra.file for single file attachment
