@@ -987,6 +987,12 @@ async function handleFinalMessage(lastMessageIdInChatArray) {
         return;
     }
 
+    // Capture the active request immediately and clear it to prevent duplicate handling
+    // This is necessary because GENERATION_ENDED can fire multiple times (e.g., with tool calls)
+    // and the await below would allow another handler to run concurrently
+    const currentRequest = activeRequest;
+    activeRequest = null;
+
     const lastMessageIndex = lastMessageIdInChatArray - 1;
     if (lastMessageIndex < 0) return;
 
@@ -997,7 +1003,7 @@ async function handleFinalMessage(lastMessageIdInChatArray) {
     const lastMessage = context.chat[lastMessageIndex];
 
     // Scan for media generated during this request
-    const startIdx = activeRequest.startMessageIndex || 0;
+    const startIdx = currentRequest.startMessageIndex || 0;
     log('log', `Scanning for media from index ${startIdx} to ${context.chat.length - 1} (chat length: ${context.chat.length})`);
     const mediaItems = scanMessagesForMedia(startIdx, context.chat.length);
     log('log', `Found ${mediaItems.length} media items total`);
@@ -1041,18 +1047,18 @@ async function handleFinalMessage(lastMessageIdInChatArray) {
                 }
             }
 
-            log('log', `Sending final message to bot ${activeRequest.botId} with ${images.length} images`);
+            log('log', `Sending final message to bot ${currentRequest.botId} with ${images.length} images`);
 
             // Build the payload
             const payload = {
-                chatId: activeRequest.chatId,
-                botId: activeRequest.botId,
+                chatId: currentRequest.chatId,
+                botId: currentRequest.botId,
                 text: renderedText,
                 images: images.length > 0 ? images : undefined,
             };
 
             // Send appropriate message type based on streaming state
-            if (activeRequest.isStreaming) {
+            if (currentRequest.isStreaming) {
                 sendToServer({
                     type: 'final_message_update',
                     ...payload,
@@ -1063,9 +1069,6 @@ async function handleFinalMessage(lastMessageIdInChatArray) {
                     ...payload,
                 });
             }
-
-            // Clear active request
-            activeRequest = null;
         }
     }
 }
