@@ -1,46 +1,42 @@
 services:
-  telegram-bridge:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: st-telegram-bridge
-    restart: unless-stopped
+    telegram-bridge:
+        build:
+            context: .
+            dockerfile: Dockerfile
+        container_name: st-telegram-bridge
+        restart: unless-stopped
 
-    ports:
-      - "2333:2333"
+        ports:
+            - "2333:2333"
 
-    volumes:
-      # Mount config file
-      # - /home/stefan/docker/SillyTavern-Telegram-Connector/server/config.js:/app/config.js:ro
-      - ./config.js:/app/config.js:ro
+        volumes:
+            # Mount config file (copy config.example.js to config.js and customize)
+            - ./config.js:/app/config.js:ro
 
-      # Optional: Mount for logs if you want to persist them
-      # - ./logs:/app/logs
+        # Health check to monitor container status
+        healthcheck:
+            test: ["CMD", "node", "-e", "const ws=new(require('ws'))('ws://localhost:2333');ws.on('error',()=>process.exit(1));ws.on('open',()=>{ws.close();process.exit(0)})"]
+            interval: 30s
+            timeout: 10s
+            retries: 3
+            start_period: 10s
 
-    # Health check to monitor container status
-    healthcheck:
-      test: ["CMD", "node", "-e", "require('ws').createConnection({host:'localhost',port:2333}).on('error',()=>process.exit(1)).on('open',()=>process.exit(0))"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 10s
+        # Resource limits (adjust as needed)
+        deploy:
+            resources:
+                limits:
+                    cpus: '0.5'
+                    memory: 256M
+                reservations:
+                    cpus: '0.1'
+                    memory: 128M
 
-    # Resource limits (adjust as needed)
-    deploy:
-      resources:
-        limits:
-          cpus: '0.5'
-          memory: 256M
-        reservations:
-          cpus: '0.1'
-          memory: 128M
-
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
+        logging:
+            driver: "json-file"
+            options:
+                max-size: "10m"
+                max-file: "3"
 
 volumes:
-  telegram-bridge-data:
-    driver: local
+    telegram-bridge-data:
+        driver: local
