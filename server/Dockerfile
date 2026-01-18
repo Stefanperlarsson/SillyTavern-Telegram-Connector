@@ -1,4 +1,4 @@
-FROM node:14-alpine
+FROM node:18-alpine
 
 # Set working directory
 WORKDIR /app
@@ -6,18 +6,18 @@ WORKDIR /app
 # Copy package files
 COPY package*.json ./
 
-# Install dependencies
-RUN npm install
+# Install production dependencies
+RUN npm install --production
 
 # Copy application files
-COPY server.js ./
+COPY src/ ./src/
 
 # Expose WebSocket port
 EXPOSE 2333
 
 # Add healthcheck
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-  CMD node -e "require('http').get('http://localhost:2333',(r)=>{process.exit(r.statusCode==400?0:1)}).on('error',()=>process.exit(1))"
+    CMD node -e "const ws=new(require('ws'))('ws://localhost:2333');ws.on('error',()=>process.exit(1));ws.on('open',()=>{ws.close();process.exit(0)})"
 
 # Run as non-root user for security
 RUN addgroup -g 1001 -S nodejs && \
@@ -27,4 +27,4 @@ RUN addgroup -g 1001 -S nodejs && \
 USER nodejs
 
 # Start the server
-CMD ["node", "server.js"]
+CMD ["node", "src/server.js"]
