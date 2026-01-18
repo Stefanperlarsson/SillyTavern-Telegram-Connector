@@ -826,22 +826,10 @@ async function setupAndRunGeneration(chatId, botId, characterName, startMessageI
     };
     eventSource.on(event_types.STREAM_TOKEN_RECEIVED, streamCallback);
 
-    // Define cleanup function
-    let errorOccurred = false;
-    const cleanup = () => {
+    // Define cleanup function for streaming
+    const cleanupStreaming = () => {
         eventSource.removeListener(event_types.STREAM_TOKEN_RECEIVED, streamCallback);
-        if (activeRequest && activeRequest.isStreaming && !errorOccurred) {
-            sendToServer({
-                type: 'stream_end',
-                chatId: activeRequest.chatId,
-                botId: activeRequest.botId
-            });
-        }
     };
-
-    // Listen for generation end events (once to avoid interference)
-    eventSource.once(event_types.GENERATION_ENDED, cleanup);
-    eventSource.once(event_types.GENERATION_STOPPED, cleanup);
 
     // Trigger generation
     try {
@@ -850,9 +838,29 @@ async function setupAndRunGeneration(chatId, botId, characterName, startMessageI
         setExternalAbortController(abortController);
         await Generate('normal', { signal: abortController.signal });
         log('log', 'Generate() call completed');
+
+        // Clean up streaming listener
+        cleanupStreaming();
+
+        // Send stream_end if we were streaming
+        if (activeRequest && activeRequest.isStreaming) {
+            sendToServer({
+                type: 'stream_end',
+                chatId: activeRequest.chatId,
+                botId: activeRequest.botId
+            });
+        }
+
+        // Handle the final message now that generation is complete
+        // We call this directly instead of relying on event listeners because
+        // GENERATION_ENDED fires multiple times during tool calls
+        if (activeRequest) {
+            const context = SillyTavern.getContext();
+            await handleFinalMessage(context.chat.length);
+        }
     } catch (error) {
         log('error', 'Generate() error:', error);
-        errorOccurred = true;
+        cleanupStreaming();
 
         // Delete all messages created since the request started
         // This includes: user message, any tool call messages, failed AI responses
@@ -884,7 +892,6 @@ async function setupAndRunGeneration(chatId, botId, characterName, startMessageI
             });
         }
 
-        cleanup();
         activeRequest = null;
     }
 }
@@ -1073,9 +1080,9 @@ async function handleFinalMessage(lastMessageIdInChatArray) {
     }
 }
 
-// Register global event listeners for final message handling
-eventSource.on(event_types.GENERATION_ENDED, handleFinalMessage);
-eventSource.on(event_types.GENERATION_STOPPED, handleFinalMessage);
+// NOTE: We do NOT register global listeners for GENERATION_ENDED/GENERATION_STOPPED here.
+// These events fire for ALL generations in SillyTavern, including internal ones during tool calls.
+// Instead, we register .once() handlers in setupAndRunGeneration() only for our own requests.
 
 // Register event listener for image generation start
 eventSource.on('sd_prompt_processing', () => {
