@@ -22,6 +22,7 @@ const COMMANDS = Object.freeze({
     SWITCH_CHARACTER: 'switchchar',
     PING: 'ping',
     EXIT: 'exit',
+    HISTORY: 'history',
 });
 
 /**
@@ -40,6 +41,7 @@ const EVENTS = Object.freeze({
     COMMAND_EXECUTED: 'command_executed',
     USER_MESSAGE: 'user_message',
     EXECUTE_COMMAND: 'execute_command',
+    HISTORY_FILE: 'history_file',
 });
 
 /**

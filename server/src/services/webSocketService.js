@@ -277,6 +277,10 @@ class WebSocketService {
                 this._handleChatAction(data);
                 break;
 
+            case EVENTS.HISTORY_FILE:
+                await this._handleHistoryFile(data);
+                break;
+
             default:
                 Logger.debug(`Unknown message type: ${data.type}`);
         }
@@ -632,6 +636,45 @@ class WebSocketService {
         sendAction();
         const intervalId = setInterval(sendAction, 4000);
         this._activeChatActions.set(actionKey, intervalId);
+    }
+
+    /**
+     * Handles history file from SillyTavern.
+     * @param {Object} data - History file data.
+     * @private
+     */
+    async _handleHistoryFile(data) {
+        if (!data.chatId || !data.botId || !data.fileData || !data.fileName) {
+            Logger.error('Received history_file with missing required fields');
+            return;
+        }
+
+        const managedBot = this._botLookup?.(data.botId);
+        if (!managedBot) {
+            Logger.error(`Received history_file for unknown bot: ${data.botId}`);
+            return;
+        }
+
+        try {
+            Logger.info(`Sending history file to chat ${data.chatId}: ${data.fileName}`);
+
+            // Convert base64 to Buffer
+            const fileBuffer = Buffer.from(data.fileData, 'base64');
+
+            // Send as document
+            await managedBot.instance.sendDocument(data.chatId, fileBuffer, {}, {
+                filename: data.fileName,
+                contentType: 'text/html',
+            });
+
+            Logger.info('History file sent successfully');
+        } catch (error) {
+            Logger.error(`Failed to send history file: ${error.message}`);
+            await managedBot.instance.sendMessage(data.chatId, 'Failed to send chat history file.')
+                .catch((err) => Logger.error('Failed to send error message:', err.message));
+        }
+
+        QueueManager.getInstance().releaseJob();
     }
 
     /**

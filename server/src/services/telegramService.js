@@ -370,16 +370,6 @@ class TelegramService {
         let text = message.text || message.caption || '';
         const files = this._extractFileAttachments(message);
 
-        // Apply timestamp
-        if (this._configuration?.behavior?.userMessageFormat) {
-            const dateString = this._formatTimestamp(message.date);
-            const timestampPrefix = this._configuration.behavior.userMessageFormat.replace('{{date}}', dateString);
-
-            if (text || files.length > 0) {
-                text = timestampPrefix + text;
-            }
-        }
-
         Logger.info(`Received message for "${managedBot.characterName}" from user ${userId}: text="${text.substring(0, 50)}${text.length > 50 ? '...' : ''}", files=${files.length}`);
 
         if (!text && files.length === 0) {
@@ -387,10 +377,20 @@ class TelegramService {
             return;
         }
 
-        // Handle commands
+        // Handle commands (check BEFORE applying timestamp prefix)
         if (text.startsWith('/') && files.length === 0) {
             this._handleCommand(managedBot, message);
             return;
+        }
+
+        // Apply timestamp (only for regular messages, not commands)
+        if (this._configuration?.behavior?.userMessageFormat) {
+            const dateString = this._formatTimestamp(message.date);
+            const timestampPrefix = this._configuration.behavior.userMessageFormat.replace('{{date}}', dateString);
+
+            if (text || files.length > 0) {
+                text = timestampPrefix + text;
+            }
         }
 
         // Regular messages
@@ -432,7 +432,7 @@ class TelegramService {
         }
 
         // Queued commands
-        if ([COMMANDS.NEW, COMMANDS.LIST_CHATS].includes(command) || command.match(/^switchchat_?\d*$/)) {
+        if ([COMMANDS.NEW, COMMANDS.LIST_CHATS, COMMANDS.HISTORY].includes(command) || command.match(/^switchchat_?\d*$/)) {
             this._enqueueCommand(managedBot, message, command, commandArguments);
             return;
         }
@@ -502,6 +502,7 @@ Chat Management
 /switchchat_<N> - Load chat log by number
 /delete [n] - Delete the last n messages (default 1)
 /trigger - Manually trigger a new AI response
+/history - Export current chat history as HTML file
 
 System Management
 /reload - Reload server configuration
