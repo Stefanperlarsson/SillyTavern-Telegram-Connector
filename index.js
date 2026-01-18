@@ -688,10 +688,16 @@ async function handleFinalMessage(lastMessageIdInChatArray) {
         return;
     }
 
+    // Capture request data early to avoid race conditions after awaits
+    const currentRequest = activeRequest;
+    const startIndex = currentRequest.startMessageIndex || 0;
+    const chatId = currentRequest.chatId;
+    const botId = currentRequest.botId;
+    const isStreaming = currentRequest.isStreaming;
+
     await new Promise((resolve) => setTimeout(resolve, 100));
 
     const lastMessage = adapter.getMessage(lastMessageIndex);
-    const startIndex = activeRequest.startMessageIndex || 0;
     const mediaItems = scanMessagesForMedia(startIndex, adapter.getChatLength());
 
     if (lastMessage && !lastMessage.is_user && !lastMessage.is_system) {
@@ -723,20 +729,10 @@ async function handleFinalMessage(lastMessageIdInChatArray) {
 
             log('log', `Sending final message with ${images.length} images`);
 
-            if (activeRequest.isStreaming) {
-                bridgeClient.sendFinalMessageUpdate(
-                    activeRequest.chatId,
-                    activeRequest.botId,
-                    renderedText,
-                    images
-                );
+            if (isStreaming) {
+                bridgeClient.sendFinalMessageUpdate(chatId, botId, renderedText, images);
             } else {
-                bridgeClient.sendAiReply(
-                    activeRequest.chatId,
-                    activeRequest.botId,
-                    renderedText,
-                    images
-                );
+                bridgeClient.sendAiReply(chatId, botId, renderedText, images);
             }
 
             activeRequest = null;
