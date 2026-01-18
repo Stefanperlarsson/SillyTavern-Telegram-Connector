@@ -215,12 +215,22 @@ class WebSocketService {
             data = JSON.parse(rawMessage.toString());
 
             // Sanitize bot output if configured
-            if (this._messageSanitizer && data.text) {
-                const isOutputMessage = data.type === EVENTS.STREAM_CHUNK ||
-                    data.type === EVENTS.FINAL_MESSAGE_UPDATE ||
-                    data.type === EVENTS.AI_REPLY;
-                if (isOutputMessage) {
+            const isOutputMessage = data.type === EVENTS.STREAM_CHUNK ||
+                data.type === EVENTS.FINAL_MESSAGE_UPDATE ||
+                data.type === EVENTS.AI_REPLY;
+
+            if (this._messageSanitizer && isOutputMessage) {
+                // Sanitize legacy text field
+                if (data.text) {
                     data.text = this._messageSanitizer(data.text);
+                }
+                // Sanitize new contentParts format
+                if (data.contentParts && Array.isArray(data.contentParts)) {
+                    for (const part of data.contentParts) {
+                        if (part.type === 'text' && part.content) {
+                            part.content = this._messageSanitizer(part.content);
+                        }
+                    }
                 }
             }
 

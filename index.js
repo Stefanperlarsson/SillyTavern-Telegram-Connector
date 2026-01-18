@@ -1028,18 +1028,27 @@ async function handleFinalMessage(lastMessageIdInChatArray) {
 
         log('log', `  Message ${i}: processing AI message`);
 
-        // Extract text content from this message
-        const textContent = extractMessageText(i);
-        if (textContent) {
-            contentParts.push({
-                type: 'text',
-                content: textContent,
-            });
-            log('log', `    Added text part (${textContent.length} chars)`);
+        // Check if this message has media attachments (images)
+        const hasMedia = msg.extra?.media?.length > 0;
+
+        // Extract text content from this message, but SKIP text for messages with media
+        // Messages with images typically contain auto-generated descriptions like
+        // "[Assistant shows an image of ...]" which shouldn't be sent to Telegram
+        if (!hasMedia) {
+            const textContent = extractMessageText(i);
+            if (textContent) {
+                contentParts.push({
+                    type: 'text',
+                    content: textContent,
+                });
+                log('log', `    Added text part (${textContent.length} chars)`);
+            }
+        } else {
+            log('log', `    Skipping text extraction (message has media)`);
         }
 
         // Check for media attachments on this message
-        if (msg.extra?.media?.length > 0) {
+        if (hasMedia) {
             for (const media of msg.extra.media) {
                 if (media.type === 'image' && media.url) {
                     log('log', `    Found image: ${media.url.substring(0, 50)}...`);
