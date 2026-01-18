@@ -581,10 +581,6 @@ async function handleExecuteCommand(data) {
     const context = SillyTavern.getContext();
     let result = { success: false, message: 'Unknown command' };
 
-    // Debug: log exact command value and type
-    log('log', `DEBUG: command="${data.command}", type=${typeof data.command}, length=${data.command?.length}`);
-    log('log', `DEBUG: command === 'history' ? ${data.command === 'history'}`);
-
     try {
         switch (data.command) {
             // --- Character Switch (queued) ---
@@ -733,10 +729,8 @@ async function handleExecuteCommand(data) {
             // Note: This command sends history_file directly which handles job release,
             // so we return early to avoid sending command_executed
             case 'history':
-                log('log', `Processing history command for character: ${data.characterName}`);
                 try {
                     await handleHistoryCommand(chatId, botId, data.characterName);
-                    log('log', 'History command completed successfully, returning without command_executed');
                     // Don't send command_executed - history_file message will release the job
                     return;
                 } catch (err) {
@@ -1135,8 +1129,6 @@ async function handleHistoryCommand(chatId, botId, characterName) {
     
     // Fallback for character name
     const charName = characterName || context.name2 || 'Character';
-    
-    log('log', `handleHistoryCommand called: chatId=${chatId}, botId=${botId}, characterName=${charName}`);
     
     // Check if there's a chat loaded
     if (!context.chat || context.chat.length === 0) {
