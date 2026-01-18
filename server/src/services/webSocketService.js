@@ -372,7 +372,7 @@ class WebSocketService {
             };
             this._ongoingStreams.set(streamKey, session);
 
-            managedBot.instance.sendMessage(data.chatId, 'Thinking...')
+            managedBot.instance.sendMessage(data.chatId, 'Typing...')
                 .then((sentMessage) => {
                     resolveMessagePromise(sentMessage.message_id);
                 })
@@ -465,12 +465,6 @@ class WebSocketService {
             return;
         }
 
-        // Send images first
-        if (data.images && data.images.length > 0 && this._imageSender) {
-            Logger.info(`Sending ${data.images.length} image(s) to Telegram`);
-            await this._imageSender(managedBot, data.chatId, data.images);
-        }
-
         // Split message
         const splitChar = this._messageSplitter?.() || '';
         const parts = splitChar ? data.text.split(splitChar) : [data.text];
@@ -505,6 +499,12 @@ class WebSocketService {
             Logger.info('Sending non-streaming reply (Anchor)');
             await managedBot.instance.sendMessage(data.chatId, parts[anchorIndex])
                 .catch((error) => Logger.error('Failed to send final message:', error.message));
+        }
+
+        // Send images after anchor text message
+        if (data.images && data.images.length > 0 && this._imageSender) {
+            Logger.info(`Sending ${data.images.length} image(s) to Telegram`);
+            await this._imageSender(managedBot, data.chatId, data.images);
         }
 
         // Send remaining parts
