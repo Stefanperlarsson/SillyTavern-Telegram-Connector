@@ -725,6 +725,23 @@ async function handleExecuteCommand(data) {
                 }
                 break;
 
+            // --- History Export ---
+            case 'history':
+                try {
+                    await handleHistoryCommand(chatId, botId, data.characterName);
+                    result = {
+                        success: true,
+                        message: 'History file generated successfully.'
+                    };
+                } catch (err) {
+                    log('error', 'Failed to generate history:', err);
+                    result = {
+                        success: false,
+                        message: `Failed to generate history: ${err.message}`
+                    };
+                }
+                break;
+
             default:
                 // Handle numbered commands (switchchat_N)
                 const chatMatch = data.command.match(/^switchchat_(\d+)$/);
@@ -1096,6 +1113,173 @@ eventSource.on('sd_prompt_processing', () => {
         });
     }
 });
+
+// ============================================================================
+// HISTORY EXPORT
+// ============================================================================
+
+/**
+ * Handles the /history command by generating and sending an HTML file
+ * @param {number} chatId - Telegram chat ID
+ * @param {string} botId - Bot identifier
+ * @param {string} characterName - Character name for the filename
+ */
+async function handleHistoryCommand(chatId, botId, characterName) {
+    const context = SillyTavern.getContext();
+    
+    // Check if there's a chat loaded
+    if (!context.chat || context.chat.length === 0) {
+        sendToServer({
+            type: 'error_message',
+            chatId: chatId,
+            botId: botId,
+            text: 'No chat history available. Start a conversation first!'
+        });
+        return;
+    }
+
+    log('log', `Generating chat history HTML for ${characterName}, ${context.chat.length} messages`);
+
+    // Generate HTML
+    const html = generateHistoryHTML(context.chat, characterName, context.name1 || 'You');
+    
+    // Convert to base64
+    const base64Data = btoa(unescape(encodeURIComponent(html)));
+    
+    // Generate filename with date
+    const now = new Date();
+    const dateStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+    const fileName = `History_${characterName}_${dateStr}.html`;
+    
+    log('log', `Sending history file: ${fileName}, size: ${base64Data.length} chars`);
+    
+    // Send to server
+    sendToServer({
+        type: 'history_file',
+        chatId: chatId,
+        botId: botId,
+        fileData: base64Data,
+        fileName: fileName
+    });
+}
+
+/**
+ * Generates HTML for chat history
+ * @param {Array} chat - Chat messages array
+ * @param {string} characterName - Character name
+ * @param {string} userName - User name
+ * @returns {string} HTML string
+ */
+function generateHistoryHTML(chat, characterName, userName) {
+    const htmlParts = [];
+    
+    // HTML header with dark mode styling
+    htmlParts.push(`<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chat History: ${escapeHtml(characterName)}</title>
+<style>
+  body { 
+    background-color: #1e1e1e; 
+    color: #eee; 
+    font-family: sans-serif; 
+    max-width: 800px; 
+    margin: auto; 
+    padding: 20px; 
+  }
+  .msg { 
+    padding: 10px; 
+    margin-bottom: 10px; 
+    border-radius: 8px; 
+  }
+  .user { 
+    background-color: #2b5278; 
+    text-align: right; 
+    margin-left: 20%; 
+  }
+  .char { 
+    background-color: #2b2b2b; 
+    text-align: left; 
+    margin-right: 20%; 
+  }
+  .system {
+    background-color: #3a3a3a;
+    text-align: center;
+    font-style: italic;
+    color: #aaa;
+  }
+  .name { 
+    font-weight: bold; 
+    font-size: 0.9em; 
+    margin-bottom: 5px; 
+    color: #aaa; 
+  }
+  .content {
+    white-space: pre-wrap;
+    word-wrap: break-word;
+  }
+  .timestamp {
+    font-size: 0.8em;
+    color: #888;
+    margin-top: 5px;
+  }
+  img {
+    max-width: 100%;
+    border-radius: 4px;
+    margin-top: 8px;
+  }
+</style>
+</head>
+<body>
+  <h2>Chat History: ${escapeHtml(characterName)}</h2>
+  <p style="color: #888; font-size: 0.9em;">Exported on ${new Date().toLocaleString()}</p>
+  <hr style="border-color: #444;">
+`);
+
+    // Process each message
+    for (const msg of chat) {
+        if (msg.is_system) {
+            // System message
+            htmlParts.push(`  <div class="msg system">
+    <div class="content">${escapeHtml(msg.mes || '')}</div>
+  </div>
+`);
+        } else if (msg.is_user) {
+            // User message
+            htmlParts.push(`  <div class="msg user">
+    <div class="name">${escapeHtml(userName)}</div>
+    <div class="content">${escapeHtml(msg.mes || '')}</div>
+  </div>
+`);
+        } else {
+            // Character message
+            htmlParts.push(`  <div class="msg char">
+    <div class="name">${escapeHtml(characterName)}</div>
+    <div class="content">${escapeHtml(msg.mes || '')}</div>
+  </div>
+`);
+        }
+    }
+
+    // HTML footer
+    htmlParts.push(`</body>
+</html>`);
+
+    return htmlParts.join('');
+}
+
+/**
+ * Escapes HTML special characters
+ * @param {string} text - Text to escape
+ * @returns {string} Escaped text
+ */
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
 
 // ============================================================================
 // EXTENSION INITIALIZATION

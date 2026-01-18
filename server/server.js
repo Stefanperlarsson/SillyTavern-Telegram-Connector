@@ -931,6 +931,7 @@ Chat Management
 /switchchat_<N> - Load chat log by number
 /delete [n] - Delete the last n messages (default 1)
 /trigger - Manually trigger a new AI response
+/history - Export current chat history as HTML file
 
 System Management
 /reload - Reload server configuration
@@ -949,7 +950,7 @@ Note: This bot is dedicated to ${managedBot.characterName}. Messages you send wi
     }
 
     // Commands that need queueing (they interact with SillyTavern)
-    if (['new', 'listchats'].includes(command) || command.match(/^switchchat_?\d*$/)) {
+    if (['new', 'listchats', 'history'].includes(command) || command.match(/^switchchat_?\d*$/)) {
         /** @type {QueueJob} */
         const job = {
             id: '',
@@ -1560,6 +1561,37 @@ wss.on('connection', ws => {
                     const intervalId = setInterval(sendAction, 4000);
                     activeChatActions.set(actionKey, intervalId);
                 }
+                return;
+            }
+
+            // --- Handle history file ---
+            if (data.type === 'history_file' && data.chatId && data.botId && data.fileData && data.fileName) {
+                const bot = managedBots.get(data.botId);
+                if (!bot) {
+                    logWithTimestamp('error', `Received history_file for unknown bot: ${data.botId}`);
+                    return;
+                }
+
+                try {
+                    logWithTimestamp('log', `Sending history file to chat ${data.chatId}: ${data.fileName}`);
+                    
+                    // Convert base64 to Buffer
+                    const fileBuffer = Buffer.from(data.fileData, 'base64');
+                    
+                    // Send as document
+                    await bot.instance.sendDocument(data.chatId, fileBuffer, {}, {
+                        filename: data.fileName,
+                        contentType: 'text/html',
+                    });
+                    
+                    logWithTimestamp('log', `History file sent successfully`);
+                } catch (err) {
+                    logWithTimestamp('error', `Failed to send history file: ${err.message}`);
+                    await bot.instance.sendMessage(data.chatId, 'Failed to send chat history file.')
+                        .catch(e => logWithTimestamp('error', 'Failed to send error message:', e.message));
+                }
+                
+                releaseJob();
                 return;
             }
 
