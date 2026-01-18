@@ -581,6 +581,10 @@ async function handleExecuteCommand(data) {
     const context = SillyTavern.getContext();
     let result = { success: false, message: 'Unknown command' };
 
+    // Debug: log exact command value and type
+    log('log', `DEBUG: command="${data.command}", type=${typeof data.command}, length=${data.command?.length}`);
+    log('log', `DEBUG: command === 'history' ? ${data.command === 'history'}`);
+
     try {
         switch (data.command) {
             // --- Character Switch (queued) ---
