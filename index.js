@@ -166,49 +166,6 @@ async function fetchImageAsBase64(imageUrl) {
 }
 
 /**
- * Scans messages created during the current request for media
- * @param {number} startIndex - Index to start scanning from
- * @param {number} endIndex - Index to stop scanning at (exclusive)
- * @returns {MediaItem[]} Array of media items found
- */
-function scanMessagesForMedia(startIndex, endIndex) {
-    const context = SillyTavern.getContext();
-    const mediaItems = [];
-
-    log('log', `scanMessagesForMedia: checking messages ${startIndex} to ${endIndex - 1}`);
-
-    for (let i = startIndex; i < endIndex; i++) {
-        const msg = context.chat[i];
-
-        // Skip user messages - we don't want to send user's own images back to them
-        if (msg?.is_user) {
-            log('log', `  Message ${i}: skipping (is_user=true)`);
-            continue;
-        }
-
-        const hasMedia = msg?.extra?.media?.length > 0;
-        log('log', `  Message ${i}: hasMedia=${hasMedia}, is_user=${msg?.is_user}, is_system=${msg?.is_system}`);
-
-        if (hasMedia) {
-            for (const media of msg.extra.media) {
-                log('log', `    Media found: type=${media.type}, hasUrl=${!!media.url}, urlLen=${media.url?.length}`);
-                if (media.type === 'image' && media.url) {
-                    mediaItems.push({
-                        type: media.type,
-                        url: media.url,
-                        title: media.title || ''
-                    });
-                    log('log', `    -> Added to mediaItems`);
-                }
-            }
-        }
-    }
-
-    log('log', `scanMessagesForMedia: returning ${mediaItems.length} items`);
-    return mediaItems;
-}
-
-/**
  * @typedef {Object} UploadedFile
  * @property {string} url - URL path to the uploaded file
  * @property {string} type - 'image' | 'video' | 'audio' | 'file'
@@ -998,8 +955,36 @@ async function handleUserMessage(data) {
 // ============================================================================
 
 /**
+ * Extracts rendered text content from a message DOM element
+ * @param {number} messageIndex - Index of the message in the chat array
+ * @returns {string} The extracted text content, or empty string if not found
+ */
+function extractMessageText(messageIndex) {
+    const messageElement = $(`#chat .mes[mesid="${messageIndex}"]`);
+
+    if (messageElement.length === 0) {
+        return '';
+    }
+
+    const messageTextElement = messageElement.find('.mes_text');
+
+    // Get HTML content and convert to plain text
+    let renderedText = messageTextElement.html()
+        .replace(/<br\s*\/?>/gi, '\n')
+        .replace(/<\/p>\s*<p>/gi, '\n\n');
+
+    // Decode HTML entities
+    const tempDiv = document.createElement('div');
+    tempDiv.innerHTML = renderedText;
+    renderedText = tempDiv.textContent;
+
+    return renderedText.trim();
+}
+
+/**
  * Handles the final message after generation completes
  * Extracts rendered text from the DOM and sends it to the server
+ * Preserves the order of text and images as they appear in the chat
  * @param {number} lastMessageIdInChatArray - Index of the last message in the chat array
  */
 async function handleFinalMessage(lastMessageIdInChatArray) {
@@ -1024,86 +1009,66 @@ async function handleFinalMessage(lastMessageIdInChatArray) {
     await new Promise(resolve => setTimeout(resolve, 100));
 
     const context = SillyTavern.getContext();
-
-    // Scan for media generated during this request
     const startIdx = currentRequest.startMessageIndex || 0;
-    log('log', `Scanning for media from index ${startIdx} to ${context.chat.length - 1} (chat length: ${context.chat.length})`);
-    const mediaItems = scanMessagesForMedia(startIdx, context.chat.length);
-    log('log', `Found ${mediaItems.length} media items total`);
 
-    // Debug: show what we found
-    if (mediaItems.length > 0) {
-        mediaItems.forEach((item, idx) => {
-            log('log', `  Media item ${idx}: type=${item.type}, url=${item.url?.substring(0, 50)}...`);
-        });
-    }
+    log('log', `Processing messages from index ${startIdx} to ${context.chat.length - 1} (chat length: ${context.chat.length})`);
 
-    // Collect ALL non-user, non-system messages created during this request
-    const aiMessages = [];
+    // Build an ordered array of content parts (text and images) as they appear in the chat
+    // This preserves the original order: Message1 -> Image -> Message2
+    const contentParts = [];
+
     for (let i = startIdx; i < context.chat.length; i++) {
         const msg = context.chat[i];
-        if (msg && !msg.is_user && !msg.is_system) {
-            aiMessages.push({ index: i, message: msg });
+
+        // Skip user messages and system messages
+        if (!msg || msg.is_user || msg.is_system) {
+            log('log', `  Message ${i}: skipping (is_user=${msg?.is_user}, is_system=${msg?.is_system})`);
+            continue;
+        }
+
+        log('log', `  Message ${i}: processing AI message`);
+
+        // Extract text content from this message
+        const textContent = extractMessageText(i);
+        if (textContent) {
+            contentParts.push({
+                type: 'text',
+                content: textContent,
+            });
+            log('log', `    Added text part (${textContent.length} chars)`);
+        }
+
+        // Check for media attachments on this message
+        if (msg.extra?.media?.length > 0) {
+            for (const media of msg.extra.media) {
+                if (media.type === 'image' && media.url) {
+                    log('log', `    Found image: ${media.url.substring(0, 50)}...`);
+                    const imageData = await fetchImageAsBase64(media.url);
+                    if (imageData) {
+                        contentParts.push({
+                            type: 'image',
+                            base64: imageData.base64,
+                            mimeType: imageData.mimeType,
+                        });
+                        log('log', `    Added image part (${imageData.mimeType}, ${imageData.base64.length} chars)`);
+                    }
+                }
+            }
         }
     }
 
-    log('log', `Found ${aiMessages.length} AI message(s) to send`);
-
-    if (aiMessages.length === 0) {
-        log('warn', 'No AI messages found to send');
+    if (contentParts.length === 0) {
+        log('warn', 'No content parts found to send');
         return;
     }
 
-    // Fetch and convert images to base64 for transmission
-    const images = [];
-    for (const media of mediaItems) {
-        if (media.type === 'image') {
-            const imageData = await fetchImageAsBase64(media.url);
-            if (imageData) {
-                images.push({
-                    base64: imageData.base64,
-                    mimeType: imageData.mimeType,
-                });
-                log('log', `Prepared image for sending: ${imageData.mimeType}, ${imageData.base64.length} chars`);
-            }
-        }
-    }
+    log('log', `Sending ${contentParts.length} content part(s) to bot ${currentRequest.botId}`);
 
-    // Extract and combine text from all AI messages
-    const textParts = [];
-    for (const { index, message } of aiMessages) {
-        const messageElement = $(`#chat .mes[mesid="${index}"]`);
-
-        if (messageElement.length > 0) {
-            const messageTextElement = messageElement.find('.mes_text');
-
-            // Get HTML content and convert to plain text
-            let renderedText = messageTextElement.html()
-                .replace(/<br\s*\/?>/gi, '\n')
-                .replace(/<\/p>\s*<p>/gi, '\n\n');
-
-            // Decode HTML entities
-            const tempDiv = document.createElement('div');
-            tempDiv.innerHTML = renderedText;
-            renderedText = tempDiv.textContent;
-
-            if (renderedText.trim()) {
-                textParts.push(renderedText.trim());
-            }
-        }
-    }
-
-    // Combine all text parts with double newline separator
-    const combinedText = textParts.join('\n\n');
-
-    log('log', `Sending final message to bot ${currentRequest.botId} with ${images.length} images and ${aiMessages.length} text parts`);
-
-    // Build the payload
+    // Build the payload with ordered content parts
     const payload = {
         chatId: currentRequest.chatId,
         botId: currentRequest.botId,
-        text: combinedText,
-        images: images.length > 0 ? images : undefined,
+        contentParts: contentParts,
     };
 
     // Send appropriate message type based on streaming state
