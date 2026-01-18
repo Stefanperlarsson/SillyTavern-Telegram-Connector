@@ -1,12 +1,67 @@
+/**
+ * WebSocket client service for SillyTavern extension
+ * @module services/webSocketService
+ */
+
 import { Logger } from '../utils/logger.js';
 
-export class WebSocketService {
+/**
+ * Connection status constants
+ */
+export const ConnectionStatus = {
+    DISCONNECTED: 'Disconnected',
+    CONNECTING: 'Connecting...',
+    CONNECTED: 'Connected',
+    ERROR: 'Connection error',
+    URL_NOT_SET: 'URL not set!',
+};
+
+/**
+ * Status colors for UI display
+ */
+export const StatusColors = {
+    [ConnectionStatus.DISCONNECTED]: 'red',
+    [ConnectionStatus.CONNECTING]: 'orange',
+    [ConnectionStatus.CONNECTED]: 'green',
+    [ConnectionStatus.ERROR]: 'red',
+    [ConnectionStatus.URL_NOT_SET]: 'red',
+};
+
+/**
+ * WebSocket client service for communicating with the Telegram bridge server
+ */
+class WebSocketService {
     constructor() {
+        /** @type {WebSocket|null} */
         this.webSocket = null;
+        /** @type {Function|null} */
         this.onMessageHandler = null;
+        /** @type {Function|null} */
         this.onConnectHandler = null;
+        /** @type {Function|null} */
         this.onDisconnectHandler = null;
+        /** @type {Function|null} */
         this.onErrorHandler = null;
+        /** @type {Function|null} */
+        this.onStatusChangeHandler = null;
+    }
+
+    /**
+     * Sets the status change callback for UI updates
+     * @param {Function} callback - Called with (message, color) when status changes
+     */
+    setStatusChangeHandler(callback) {
+        this.onStatusChangeHandler = callback;
+    }
+
+    /**
+     * Updates the connection status and notifies listeners
+     * @param {string} status - Status constant from ConnectionStatus
+     */
+    _updateStatus(status) {
+        if (this.onStatusChangeHandler) {
+            this.onStatusChangeHandler(status, StatusColors[status] || 'gray');
+        }
     }
 
     /**
@@ -21,15 +76,19 @@ export class WebSocketService {
 
         if (!url) {
             Logger.error('WebSocket URL is required');
+            this._updateStatus(ConnectionStatus.URL_NOT_SET);
             return;
         }
 
+        this._updateStatus(ConnectionStatus.CONNECTING);
         Logger.info(`Connecting to ${url}...`);
+
         try {
             this.webSocket = new WebSocket(url);
 
             this.webSocket.onopen = () => {
                 Logger.info('WebSocket connection established');
+                this._updateStatus(ConnectionStatus.CONNECTED);
                 if (this.onConnectHandler) this.onConnectHandler();
             };
 
@@ -46,16 +105,20 @@ export class WebSocketService {
 
             this.webSocket.onclose = (event) => {
                 Logger.info('WebSocket connection closed');
+                this._updateStatus(ConnectionStatus.DISCONNECTED);
                 if (this.onDisconnectHandler) this.onDisconnectHandler(event);
                 this.webSocket = null;
             };
 
             this.webSocket.onerror = (error) => {
                 Logger.error('WebSocket error:', error);
+                this._updateStatus(ConnectionStatus.ERROR);
                 if (this.onErrorHandler) this.onErrorHandler(error);
+                this.webSocket = null;
             };
         } catch (error) {
             Logger.error('Failed to create WebSocket:', error);
+            this._updateStatus(ConnectionStatus.ERROR);
         }
     }
 
