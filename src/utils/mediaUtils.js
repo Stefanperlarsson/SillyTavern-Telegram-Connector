@@ -5,7 +5,7 @@
 
 import { Logger } from './logger.js';
 import { MIME_EXTENSION_MAP } from '../constants/index.js';
-import { saveBase64AsFile } from '../../../utils.js';
+import { saveBase64AsFile } from '../../../../utils.js';
 
 /**
  * @typedef {Object} MediaItem

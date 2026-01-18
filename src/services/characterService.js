@@ -1,5 +1,5 @@
 import { Logger } from '../utils/logger.js';
-import { selectCharacterById } from "../../../../script.js";
+import { selectCharacterById } from "../../../../../script.js";
 
 export class CharacterService {
     /**

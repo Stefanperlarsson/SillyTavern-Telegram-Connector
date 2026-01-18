@@ -23,7 +23,7 @@ import {
     Generate,
     setExternalAbortController,
     appendMediaToMessage,
-} from '../../../../script.js';
+} from '../../../../../script.js';
 
 const { deleteLastMessage, executeSlashCommands } = SillyTavern.getContext();
 
