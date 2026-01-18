@@ -1024,7 +1024,6 @@ async function handleFinalMessage(lastMessageIdInChatArray) {
     await new Promise(resolve => setTimeout(resolve, 100));
 
     const context = SillyTavern.getContext();
-    const lastMessage = context.chat[lastMessageIndex];
 
     // Scan for media generated during this request
     const startIdx = currentRequest.startMessageIndex || 0;
@@ -1039,9 +1038,41 @@ async function handleFinalMessage(lastMessageIdInChatArray) {
         });
     }
 
-    // Confirm this is the AI reply we just triggered
-    if (lastMessage && !lastMessage.is_user && !lastMessage.is_system) {
-        const messageElement = $(`#chat .mes[mesid="${lastMessageIndex}"]`);
+    // Collect ALL non-user, non-system messages created during this request
+    const aiMessages = [];
+    for (let i = startIdx; i < context.chat.length; i++) {
+        const msg = context.chat[i];
+        if (msg && !msg.is_user && !msg.is_system) {
+            aiMessages.push({ index: i, message: msg });
+        }
+    }
+
+    log('log', `Found ${aiMessages.length} AI message(s) to send`);
+
+    if (aiMessages.length === 0) {
+        log('warn', 'No AI messages found to send');
+        return;
+    }
+
+    // Fetch and convert images to base64 for transmission
+    const images = [];
+    for (const media of mediaItems) {
+        if (media.type === 'image') {
+            const imageData = await fetchImageAsBase64(media.url);
+            if (imageData) {
+                images.push({
+                    base64: imageData.base64,
+                    mimeType: imageData.mimeType,
+                });
+                log('log', `Prepared image for sending: ${imageData.mimeType}, ${imageData.base64.length} chars`);
+            }
+        }
+    }
+
+    // Extract and combine text from all AI messages
+    const textParts = [];
+    for (const { index, message } of aiMessages) {
+        const messageElement = $(`#chat .mes[mesid="${index}"]`);
 
         if (messageElement.length > 0) {
             const messageTextElement = messageElement.find('.mes_text');
@@ -1056,44 +1087,36 @@ async function handleFinalMessage(lastMessageIdInChatArray) {
             tempDiv.innerHTML = renderedText;
             renderedText = tempDiv.textContent;
 
-            // Fetch and convert images to base64 for transmission
-            const images = [];
-            for (const media of mediaItems) {
-                if (media.type === 'image') {
-                    const imageData = await fetchImageAsBase64(media.url);
-                    if (imageData) {
-                        images.push({
-                            base64: imageData.base64,
-                            mimeType: imageData.mimeType,
-                        });
-                        log('log', `Prepared image for sending: ${imageData.mimeType}, ${imageData.base64.length} chars`);
-                    }
-                }
-            }
-
-            log('log', `Sending final message to bot ${currentRequest.botId} with ${images.length} images`);
-
-            // Build the payload
-            const payload = {
-                chatId: currentRequest.chatId,
-                botId: currentRequest.botId,
-                text: renderedText,
-                images: images.length > 0 ? images : undefined,
-            };
-
-            // Send appropriate message type based on streaming state
-            if (currentRequest.isStreaming) {
-                sendToServer({
-                    type: 'final_message_update',
-                    ...payload,
-                });
-            } else {
-                sendToServer({
-                    type: 'ai_reply',
-                    ...payload,
-                });
+            if (renderedText.trim()) {
+                textParts.push(renderedText.trim());
             }
         }
+    }
+
+    // Combine all text parts with double newline separator
+    const combinedText = textParts.join('\n\n');
+
+    log('log', `Sending final message to bot ${currentRequest.botId} with ${images.length} images and ${aiMessages.length} text parts`);
+
+    // Build the payload
+    const payload = {
+        chatId: currentRequest.chatId,
+        botId: currentRequest.botId,
+        text: combinedText,
+        images: images.length > 0 ? images : undefined,
+    };
+
+    // Send appropriate message type based on streaming state
+    if (currentRequest.isStreaming) {
+        sendToServer({
+            type: 'final_message_update',
+            ...payload,
+        });
+    } else {
+        sendToServer({
+            type: 'ai_reply',
+            ...payload,
+        });
     }
 }
 
