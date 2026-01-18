@@ -726,13 +726,15 @@ async function handleExecuteCommand(data) {
                 break;
 
             // --- History Export ---
+            // Note: This command sends history_file directly which handles job release,
+            // so we return early to avoid sending command_executed
             case 'history':
+                log('log', `Processing history command for character: ${data.characterName}`);
                 try {
                     await handleHistoryCommand(chatId, botId, data.characterName);
-                    result = {
-                        success: true,
-                        message: 'History file generated successfully.'
-                    };
+                    log('log', 'History command completed successfully, returning without command_executed');
+                    // Don't send command_executed - history_file message will release the job
+                    return;
                 } catch (err) {
                     log('error', 'Failed to generate history:', err);
                     result = {
@@ -1127,21 +1129,20 @@ eventSource.on('sd_prompt_processing', () => {
 async function handleHistoryCommand(chatId, botId, characterName) {
     const context = SillyTavern.getContext();
     
+    // Fallback for character name
+    const charName = characterName || context.name2 || 'Character';
+    
+    log('log', `handleHistoryCommand called: chatId=${chatId}, botId=${botId}, characterName=${charName}`);
+    
     // Check if there's a chat loaded
     if (!context.chat || context.chat.length === 0) {
-        sendToServer({
-            type: 'error_message',
-            chatId: chatId,
-            botId: botId,
-            text: 'No chat history available. Start a conversation first!'
-        });
-        return;
+        throw new Error('No chat history available. Start a conversation first!');
     }
 
-    log('log', `Generating chat history HTML for ${characterName}, ${context.chat.length} messages`);
+    log('log', `Generating chat history HTML for ${charName}, ${context.chat.length} messages`);
 
     // Generate HTML
-    const html = generateHistoryHTML(context.chat, characterName, context.name1 || 'You');
+    const html = generateHistoryHTML(context.chat, charName, context.name1 || 'You');
     
     // Convert to base64
     const base64Data = btoa(unescape(encodeURIComponent(html)));
@@ -1149,7 +1150,7 @@ async function handleHistoryCommand(chatId, botId, characterName) {
     // Generate filename with date
     const now = new Date();
     const dateStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
-    const fileName = `History_${characterName}_${dateStr}.html`;
+    const fileName = `History_${charName}_${dateStr}.html`;
     
     log('log', `Sending history file: ${fileName}, size: ${base64Data.length} chars`);
     
