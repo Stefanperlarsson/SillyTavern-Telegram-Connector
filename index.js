@@ -1192,9 +1192,11 @@ async function handleSummarizeCommand(chatId, botId, characterName, summarizatio
     const userName = context.name1 || 'User';
     
     log('log', `Generating summary for ${charName}, ${context.chat.length} messages`);
+    log('log', `Config received - has prompt: ${!!summarizationConfig?.prompt}, prompt length: ${summarizationConfig?.prompt?.length || 0}`);
 
     // Get summarization prompt from config or use default
     let prompt = summarizationConfig?.prompt || DEFAULT_SUMMARIZATION_PROMPT;
+    log('log', `Using ${summarizationConfig?.prompt ? 'custom' : 'default'} prompt (${prompt.length} chars)`);
     
     // Replace template variables
     prompt = prompt
