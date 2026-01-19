@@ -23,6 +23,8 @@ const COMMANDS = Object.freeze({
     PING: 'ping',
     EXIT: 'exit',
     HISTORY: 'history',
+    SUMMARIZE: 'summarize',
+    SET_SUMMARY: 'set_summary',
 });
 
 /**

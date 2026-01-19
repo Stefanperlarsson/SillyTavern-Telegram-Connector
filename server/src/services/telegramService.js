@@ -432,8 +432,20 @@ class TelegramService {
         }
 
         // Queued commands
-        if ([COMMANDS.NEW, COMMANDS.LIST_CHATS, COMMANDS.HISTORY].includes(command) || command.match(/^switchchat_?\d*$/)) {
+        if ([COMMANDS.NEW, COMMANDS.LIST_CHATS, COMMANDS.HISTORY, COMMANDS.SUMMARIZE].includes(command) || command.match(/^switchchat_?\d*$/)) {
             this._enqueueCommand(managedBot, message, command, commandArguments);
+            return;
+        }
+
+        // Set summary command (takes remaining text as argument)
+        if (command === COMMANDS.SET_SUMMARY) {
+            const summaryText = commandArguments.join(' ');
+            if (!summaryText.trim()) {
+                managedBot.instance.sendMessage(chatId, 'Please provide summary text. Usage: /set_summary <your summary text>')
+                    .catch((error) => Logger.error('Failed to send error message:', error.message));
+                return;
+            }
+            this._enqueueCommand(managedBot, message, command, [summaryText]);
             return;
         }
 
@@ -503,6 +515,10 @@ Chat Management
 /delete [n] - Delete the last n messages (default 1)
 /trigger - Manually trigger a new AI response
 /history - Export current chat history as HTML file
+
+Memory & Summarization
+/summarize - Generate a summary of the current conversation
+/set_summary <text> - Save summary to lorebook and start new chat
 
 System Management
 /reload - Reload server configuration

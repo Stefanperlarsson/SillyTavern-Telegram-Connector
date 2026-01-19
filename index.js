@@ -23,7 +23,16 @@ import {
     Generate,
     setExternalAbortController,
     appendMediaToMessage,
+    generateQuietPrompt,
 } from "../../../../script.js";
+
+// Import World Info functions for summarization feature
+import {
+    world_names,
+    loadWorldInfo,
+    saveWorldInfo,
+    createWorldInfoEntry,
+} from "../../../../scripts/world-info.js";
 
 // Import utility functions for file handling
 import {
@@ -699,6 +708,33 @@ async function handleExecuteCommand(data) {
                 }
                 break;
 
+            // --- Summarize Conversation ---
+            case 'summarize':
+                try {
+                    result = await handleSummarizeCommand(chatId, botId, data.characterName, data.summarizationConfig);
+                } catch (err) {
+                    log('error', 'Failed to generate summary:', err);
+                    result = {
+                        success: false,
+                        message: `Failed to generate summary: ${err.message}`
+                    };
+                }
+                break;
+
+            // --- Set Summary (Save to Lorebook + New Chat) ---
+            case 'set_summary':
+                try {
+                    const summaryText = data.args && data.args.length > 0 ? data.args[0] : '';
+                    result = await handleSetSummaryCommand(chatId, botId, data.characterName, summaryText, data.summarizationConfig);
+                } catch (err) {
+                    log('error', 'Failed to save summary:', err);
+                    result = {
+                        success: false,
+                        message: `Failed to save summary: ${err.message}`
+                    };
+                }
+                break;
+
             default:
                 // Handle numbered commands (switchchat_N)
                 const chatMatch = data.command.match(/^switchchat_(\d+)$/);
@@ -1110,6 +1146,193 @@ eventSource.on('sd_prompt_processing', () => {
         });
     }
 });
+
+// ============================================================================
+// SUMMARIZATION & ARCHIVAL
+// ============================================================================
+
+/**
+ * Default summarization prompt template
+ * Used when no custom prompt is provided in config
+ */
+const DEFAULT_SUMMARIZATION_PROMPT = `You are a memory archivist. Your task is to create a concise summary of the conversation that just occurred between {{user}} and {{char}}.
+
+Focus on:
+- Key events and decisions made
+- Important information revealed about characters
+- Emotional moments or relationship developments
+- Any promises, plans, or commitments made
+
+Format the summary as a narrative paragraph, written in past tense from a third-person perspective. Keep it under 300 words.
+
+Do not include meta-commentary about the conversation itself. Write as if documenting events that actually happened.`;
+
+/**
+ * Handles the /summarize command by generating a conversation summary
+ * Uses "dry-run" generation that doesn't affect the main chat history
+ * @param {number} chatId - Telegram chat ID
+ * @param {string} botId - Bot identifier
+ * @param {string} characterName - Character name
+ * @param {Object} summarizationConfig - Config from server (optional)
+ * @returns {Promise<{success: boolean, message: string}>}
+ */
+async function handleSummarizeCommand(chatId, botId, characterName, summarizationConfig) {
+    const context = SillyTavern.getContext();
+    
+    // Check if there's a chat loaded
+    if (!context.chat || context.chat.length === 0) {
+        return {
+            success: false,
+            message: 'No conversation to summarize. Start chatting first!'
+        };
+    }
+
+    // Get character and user names for prompt substitution
+    const charName = characterName || context.name2 || 'Character';
+    const userName = context.name1 || 'User';
+    
+    log('log', `Generating summary for ${charName}, ${context.chat.length} messages`);
+
+    // Get summarization prompt from config or use default
+    let summarizationPrompt = summarizationConfig?.summarizationPrompt || DEFAULT_SUMMARIZATION_PROMPT;
+    
+    // Replace template variables
+    summarizationPrompt = summarizationPrompt
+        .replace(/\{\{user\}\}/gi, userName)
+        .replace(/\{\{char\}\}/gi, charName);
+
+    try {
+        // Generate summary using quiet generation (doesn't affect chat history)
+        // This is a "dry-run" - the output is not added to the conversation
+        const summary = await generateQuietPrompt(summarizationPrompt, false, false);
+        
+        if (!summary || summary.trim().length === 0) {
+            return {
+                success: false,
+                message: 'Failed to generate summary. The model returned an empty response.'
+            };
+        }
+
+        log('log', `Summary generated successfully (${summary.length} chars)`);
+
+        // Return the summary for the user to review
+        // The message format includes instructions for the next step
+        const responseMessage = `**Conversation Summary**\n\n${summary}\n\n---\n_Review and edit this summary as needed, then use /set_summary <text> to save it and start a new chat._`;
+
+        return {
+            success: true,
+            message: responseMessage
+        };
+    } catch (err) {
+        log('error', 'Summary generation failed:', err);
+        return {
+            success: false,
+            message: `Summary generation failed: ${err.message}`
+        };
+    }
+}
+
+/**
+ * Handles the /set_summary command by saving summary to lorebook and starting new chat
+ * @param {number} chatId - Telegram chat ID
+ * @param {string} botId - Bot identifier
+ * @param {string} characterName - Character name
+ * @param {string} summaryText - The summary text to save
+ * @param {Object} summarizationConfig - Config from server (optional)
+ * @returns {Promise<{success: boolean, message: string}>}
+ */
+async function handleSetSummaryCommand(chatId, botId, characterName, summaryText, summarizationConfig) {
+    const context = SillyTavern.getContext();
+    
+    // Validate summary text
+    if (!summaryText || summaryText.trim().length === 0) {
+        return {
+            success: false,
+            message: 'Please provide summary text. Usage: /set_summary <your summary text>'
+        };
+    }
+
+    // Get config values with defaults
+    const lorebookName = summarizationConfig?.lorebookName || 'Character Memories';
+    const entryName = summarizationConfig?.entryName || 'Past Events';
+    const charName = characterName || context.name2 || 'Character';
+
+    log('log', `Saving summary to lorebook "${lorebookName}", entry "${entryName}"`);
+
+    try {
+        // Step 1: Save to World Info / Lorebook
+        await appendToWorldInfo(lorebookName, entryName, summaryText.trim(), charName);
+        log('log', 'Summary saved to World Info successfully');
+
+        // Step 2: Start new chat (archive current conversation)
+        await doNewChat({ deleteCurrentChat: false });
+        log('log', 'New chat started successfully');
+
+        return {
+            success: true,
+            message: `Summary saved to "${lorebookName}" and new chat started.`
+        };
+    } catch (err) {
+        log('error', 'Failed to save summary:', err);
+        return {
+            success: false,
+            message: `Failed to save summary: ${err.message}`
+        };
+    }
+}
+
+/**
+ * Appends content to a World Info entry, creating the book/entry if needed
+ * @param {string} bookName - Name of the World Info book
+ * @param {string} entryName - Name/comment of the entry
+ * @param {string} content - Content to append
+ * @param {string} characterName - Character name for new book creation
+ */
+async function appendToWorldInfo(bookName, entryName, content, characterName) {
+    // Check if the lorebook exists
+    if (!world_names.includes(bookName)) {
+        throw new Error(`World Info book "${bookName}" not found. Please create it first in SillyTavern.`);
+    }
+
+    // Load the World Info book
+    const data = await loadWorldInfo(bookName);
+    if (!data || !data.entries) {
+        throw new Error(`Failed to load World Info book "${bookName}"`);
+    }
+
+    // Find existing entry by comment/name
+    let entry = Object.values(data.entries).find(
+        e => e.comment === entryName
+    );
+
+    // Create new entry if it doesn't exist
+    if (!entry) {
+        log('log', `Entry "${entryName}" not found, creating new entry`);
+        entry = createWorldInfoEntry(bookName, data);
+        entry.comment = entryName;
+        entry.key = [entryName.toLowerCase(), characterName.toLowerCase(), 'memories', 'past events'];
+        entry.constant = true; // Always include in context
+        entry.selective = false;
+        entry.position = 0; // Before main prompt
+        entry.order = 100;
+        entry.content = '# Memories\n\n';
+    }
+
+    // Format the new content with timestamp
+    const timestamp = new Date().toISOString().split('T')[0];
+    const formattedContent = `[${timestamp}]\n${content}`;
+
+    // Append content with separator
+    if (entry.content && entry.content.trim().length > 0) {
+        entry.content = `${entry.content}\n\n---\n\n${formattedContent}`;
+    } else {
+        entry.content = formattedContent;
+    }
+
+    // Save the World Info book
+    await saveWorldInfo(bookName, data, true);
+    log('log', `World Info entry "${entryName}" updated successfully`);
+}
 
 // ============================================================================
 // HISTORY EXPORT

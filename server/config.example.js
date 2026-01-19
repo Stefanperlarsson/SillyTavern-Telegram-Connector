@@ -33,6 +33,29 @@ module.exports = {
         messageSplitChar: '\n'
     },
 
+    // Summarization Configuration
+    // Used by /summarize and /set_summary commands for conversation archival
+    summarization: {
+        // System prompt for generating conversation summaries
+        // This prompt instructs the LLM how to summarize the conversation
+        summarizationPrompt: `You are a memory archivist. Your task is to create a concise summary of the conversation that just occurred between {{user}} and {{char}}.
+
+Focus on:
+- Key events and decisions made
+- Important information revealed about characters
+- Emotional moments or relationship developments
+- Any promises, plans, or commitments made
+
+Format the summary as a narrative paragraph, written in past tense from a third-person perspective. Keep it under 300 words.
+
+Do not include meta-commentary about the conversation itself. Write as if documenting events that actually happened.`,
+
+        // World Info / Lorebook settings for storing summaries
+        // The summary will be appended to an existing entry in this lorebook
+        lorebookName: 'Character Memories',  // Name of the World Info book to use
+        entryName: 'Past Events',            // Name of the entry to append summaries to
+    },
+
     // Bot-per-Character Configuration
     // Each bot in this array represents a dedicated Telegram bot for a specific SillyTavern character.
     // The server will automatically switch to the correct character before processing messages.
