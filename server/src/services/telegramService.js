@@ -652,6 +652,8 @@ Help
                 characterName: botConfiguration.characterName,
                 token: botConfiguration.token,
                 connectionProfile: botConfiguration.connectionProfile,
+                lorebookName: botConfiguration.lorebookName,
+                lorebookEntry: botConfiguration.lorebookEntry,
             };
 
             this._managedBots.set(botId, managedBot);

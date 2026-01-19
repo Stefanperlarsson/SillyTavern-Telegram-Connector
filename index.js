@@ -1194,17 +1194,17 @@ async function handleSummarizeCommand(chatId, botId, characterName, summarizatio
     log('log', `Generating summary for ${charName}, ${context.chat.length} messages`);
 
     // Get summarization prompt from config or use default
-    let summarizationPrompt = summarizationConfig?.summarizationPrompt || DEFAULT_SUMMARIZATION_PROMPT;
+    let prompt = summarizationConfig?.prompt || DEFAULT_SUMMARIZATION_PROMPT;
     
     // Replace template variables
-    summarizationPrompt = summarizationPrompt
+    prompt = prompt
         .replace(/\{\{user\}\}/gi, userName)
         .replace(/\{\{char\}\}/gi, charName);
 
     try {
         // Generate summary using quiet generation (doesn't affect chat history)
         // This is a "dry-run" - the output is not added to the conversation
-        const summary = await generateQuietPrompt(summarizationPrompt, false, false);
+        const summary = await generateQuietPrompt(prompt, false, false);
         
         if (!summary || summary.trim().length === 0) {
             return {
@@ -1254,7 +1254,7 @@ async function handleSetSummaryCommand(chatId, botId, characterName, summaryText
 
     // Get config values with defaults
     const lorebookName = summarizationConfig?.lorebookName || 'Character Memories';
-    const entryName = summarizationConfig?.entryName || 'Past Events';
+    const entryName = summarizationConfig?.lorebookEntry || 'Past Events';
     const charName = characterName || context.name2 || 'Character';
 
     log('log', `Saving summary to lorebook "${lorebookName}", entry "${entryName}"`);

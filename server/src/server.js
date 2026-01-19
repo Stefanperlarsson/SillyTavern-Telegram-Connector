@@ -183,7 +183,13 @@ async function executeCommand(job, webSocketService) {
 
     // Include summarization config for summarize/set_summary commands
     if (job.command === COMMANDS.SUMMARIZE || job.command === COMMANDS.SET_SUMMARY) {
-        payload.summarizationConfig = configuration?.summarization || null;
+        payload.summarizationConfig = {
+            // Global prompt from summarization config
+            prompt: configuration?.summarization?.prompt || null,
+            // Per-character lorebook settings from bot config
+            lorebookName: job.managedBot.lorebookName || null,
+            lorebookEntry: job.managedBot.lorebookEntry || null,
+        };
     }
 
     webSocketService.sendToSillyTavern(payload);

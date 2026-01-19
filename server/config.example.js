@@ -33,12 +33,13 @@ module.exports = {
         messageSplitChar: '\n'
     },
 
-    // Summarization Configuration
+    // Summarization Configuration (Global)
     // Used by /summarize and /set_summary commands for conversation archival
     summarization: {
-        // System prompt for generating conversation summaries
+        // System prompt for generating conversation summaries (global for all characters)
         // This prompt instructs the LLM how to summarize the conversation
-        summarizationPrompt: `You are a memory archivist. Your task is to create a concise summary of the conversation that just occurred between {{user}} and {{char}}.
+        // {{user}} and {{char}} will be replaced with actual names
+        prompt: `You are a memory archivist. Your task is to create a concise summary of the conversation that just occurred between {{user}} and {{char}}.
 
 Focus on:
 - Key events and decisions made
@@ -49,11 +50,6 @@ Focus on:
 Format the summary as a narrative paragraph, written in past tense from a third-person perspective. Keep it under 300 words.
 
 Do not include meta-commentary about the conversation itself. Write as if documenting events that actually happened.`,
-
-        // World Info / Lorebook settings for storing summaries
-        // The summary will be appended to an existing entry in this lorebook
-        lorebookName: 'Character Memories',  // Name of the World Info book to use
-        entryName: 'Past Events',            // Name of the entry to append summaries to
     },
 
     // Bot-per-Character Configuration
@@ -69,11 +65,18 @@ Do not include meta-commentary about the conversation itself. Write as if docume
             // This allows you to use different backends/models for different characters.
             // The profile must exist in SillyTavern.
             // connectionProfile: 'My GPT-4 Profile'
+            
+            // Summarization: World Info / Lorebook settings for this character
+            // The summary will be appended to an entry in this lorebook
+            // lorebookName: 'Character Memories',  // Name of the World Info book to use
+            // lorebookEntry: 'Past Events',        // Name of the entry to append summaries to
         },
         // Add more bots as needed:
         // {
         //     token: 'YOUR_SECOND_BOT_TOKEN_HERE',
-        //     characterName: 'Another Character'
+        //     characterName: 'Another Character',
+        //     lorebookName: 'Another Character Memories',
+        //     lorebookEntry: 'Past Events'
         // }
     ]
 };
