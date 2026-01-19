@@ -432,7 +432,7 @@ class TelegramService {
         }
 
         // Queued commands
-        if ([COMMANDS.NEW, COMMANDS.LIST_CHATS, COMMANDS.HISTORY].includes(command) || command.match(/^switchchat_?\d*$/)) {
+        if ([COMMANDS.NEW, COMMANDS.LIST_CHATS, COMMANDS.HISTORY, COMMANDS.SUMMARIZE].includes(command) || command.match(/^switchchat_?\d*$/)) {
             this._enqueueCommand(managedBot, message, command, commandArguments);
             return;
         }
@@ -503,6 +503,9 @@ Chat Management
 /delete [n] - Delete the last n messages (default 1)
 /trigger - Manually trigger a new AI response
 /history - Export current chat history as HTML file
+
+Memory & Summarization
+/summarize - Summarize conversation, save to lorebook, start new chat
 
 System Management
 /reload - Reload server configuration
@@ -636,6 +639,8 @@ Help
                 characterName: botConfiguration.characterName,
                 token: botConfiguration.token,
                 connectionProfile: botConfiguration.connectionProfile,
+                lorebookName: botConfiguration.lorebookName,
+                lorebookEntry: botConfiguration.lorebookEntry,
             };
 
             this._managedBots.set(botId, managedBot);

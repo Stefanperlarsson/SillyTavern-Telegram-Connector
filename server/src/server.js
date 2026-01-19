@@ -172,14 +172,25 @@ async function executeCommand(job, webSocketService) {
     job.managedBot.instance.sendChatAction(job.chatId, 'typing')
         .catch((error) => Logger.error('Failed to send typing action:', error.message));
 
-    webSocketService.sendToSillyTavern({
+    const payload = {
         type: EVENTS.EXECUTE_COMMAND,
         command: job.command,
         args: job.arguments || [],
         chatId: job.chatId,
         botId: job.managedBot.id,
         characterName: job.targetCharacter,
-    });
+    };
+
+    // Include summarization config for summarize command
+    if (job.command === COMMANDS.SUMMARIZE) {
+        payload.summarizationConfig = {
+            prompt: configuration?.summarization?.prompt || null,
+            lorebookName: job.managedBot.lorebookName || null,
+            lorebookEntry: job.managedBot.lorebookEntry || null,
+        };
+    }
+
+    webSocketService.sendToSillyTavern(payload);
 }
 
 /**

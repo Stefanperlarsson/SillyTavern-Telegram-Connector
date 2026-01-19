@@ -99,6 +99,7 @@ function mergeWithDefaults(configuration) {
         wssPort: configuration.wssPort ?? DEFAULT_CONFIGURATION.wssPort,
         allowedUserIds: configuration.allowedUserIds ?? DEFAULT_CONFIGURATION.allowedUserIds,
         bots: configuration.bots ?? DEFAULT_CONFIGURATION.bots,
+        summarization: configuration.summarization ?? null,
     };
 }
 

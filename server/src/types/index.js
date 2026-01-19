@@ -16,6 +16,8 @@
  * @property {string} token - The Telegram bot API token.
  * @property {string} characterName - The SillyTavern character name to use with this bot.
  * @property {string} [connectionProfile] - Optional connection profile name.
+ * @property {string} [lorebookName] - Optional World Info book name for storing summaries.
+ * @property {string} [lorebookEntry] - Optional World Info entry name for storing summaries.
  */
 
 /**
@@ -87,6 +89,8 @@
  * @property {string} characterName - Associated character name.
  * @property {string} token - Bot API token.
  * @property {string} [connectionProfile] - Optional connection profile.
+ * @property {string} [lorebookName] - Optional World Info book name for storing summaries.
+ * @property {string} [lorebookEntry] - Optional World Info entry name for storing summaries.
  */
 
 // =============================================================================
