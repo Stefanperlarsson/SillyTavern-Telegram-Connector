@@ -215,12 +215,22 @@ class WebSocketService {
             data = JSON.parse(rawMessage.toString());
 
             // Sanitize bot output if configured
-            if (this._messageSanitizer && data.text) {
-                const isOutputMessage = data.type === EVENTS.STREAM_CHUNK ||
-                    data.type === EVENTS.FINAL_MESSAGE_UPDATE ||
-                    data.type === EVENTS.AI_REPLY;
-                if (isOutputMessage) {
+            const isOutputMessage = data.type === EVENTS.STREAM_CHUNK ||
+                data.type === EVENTS.FINAL_MESSAGE_UPDATE ||
+                data.type === EVENTS.AI_REPLY;
+
+            if (this._messageSanitizer && isOutputMessage) {
+                // Sanitize legacy text field
+                if (data.text) {
                     data.text = this._messageSanitizer(data.text);
+                }
+                // Sanitize new contentParts format
+                if (data.contentParts && Array.isArray(data.contentParts)) {
+                    for (const part of data.contentParts) {
+                        if (part.type === 'text' && part.content) {
+                            part.content = this._messageSanitizer(part.content);
+                        }
+                    }
                 }
             }
 
@@ -372,7 +382,7 @@ class WebSocketService {
             };
             this._ongoingStreams.set(streamKey, session);
 
-            managedBot.instance.sendMessage(data.chatId, 'Thinking...')
+            managedBot.instance.sendMessage(data.chatId, 'Typing...')
                 .then((sentMessage) => {
                     resolveMessagePromise(sentMessage.message_id);
                 })
@@ -448,6 +458,7 @@ class WebSocketService {
 
     /**
      * Handles final message update.
+     * Supports both legacy format (text + images) and new ordered contentParts format.
      * @param {Object} data - Final message data.
      * @private
      */
@@ -465,12 +476,91 @@ class WebSocketService {
             return;
         }
 
-        // Send images first
-        if (data.images && data.images.length > 0 && this._imageSender) {
-            Logger.info(`Sending ${data.images.length} image(s) to Telegram`);
-            await this._imageSender(managedBot, data.chatId, data.images);
+        // Check if using new contentParts format (ordered content)
+        if (data.contentParts && Array.isArray(data.contentParts)) {
+            await this._handleOrderedContent(data, managedBot, session, streamKey);
+        } else {
+            // Legacy format: text + images (for backwards compatibility)
+            await this._handleLegacyContent(data, managedBot, session, streamKey);
         }
 
+        QueueManager.getInstance().releaseJob();
+    }
+
+    /**
+     * Handles ordered content parts (text and images in sequence).
+     * @param {Object} data - Message data with contentParts array.
+     * @param {ManagedBot} managedBot - The bot to send through.
+     * @param {StreamSession|undefined} session - Active streaming session if any.
+     * @param {string} streamKey - Key for the streaming session.
+     * @private
+     */
+    async _handleOrderedContent(data, managedBot, session, streamKey) {
+        const splitChar = this._messageSplitter?.() || '';
+        let isFirstTextPart = true;
+
+        Logger.info(`Processing ${data.contentParts.length} ordered content part(s)`);
+
+        for (let i = 0; i < data.contentParts.length; i++) {
+            const part = data.contentParts[i];
+
+            if (part.type === 'text' && part.content?.trim()) {
+                // Split text by configured character if needed
+                const textParts = splitChar ? part.content.split(splitChar) : [part.content];
+
+                for (let j = 0; j < textParts.length; j++) {
+                    const textPart = textParts[j].trim();
+                    if (!textPart) continue;
+
+                    if (isFirstTextPart && session) {
+                        // First text part edits the streaming placeholder
+                        const messageId = await session.messagePromise;
+                        if (messageId) {
+                            Logger.info('Sending final streamed message update (Anchor)');
+                            await managedBot.instance.editMessageText(textPart, {
+                                chat_id: data.chatId,
+                                message_id: messageId,
+                            }).catch((error) => {
+                                if (!error.message.includes('message is not modified')) {
+                                    Logger.error('Failed to edit final message:', error.message);
+                                }
+                            });
+                        }
+                        isFirstTextPart = false;
+                    } else {
+                        // Subsequent text parts are sent as new messages
+                        Logger.info(`Sending text part ${i}:${j}`);
+                        await managedBot.instance.sendMessage(data.chatId, textPart)
+                            .catch((error) => Logger.error('Failed to send text part:', error.message));
+                        isFirstTextPart = false;
+                    }
+                }
+            } else if (part.type === 'image' && part.base64 && this._imageSender) {
+                // Send image in order
+                Logger.info(`Sending image part ${i}`);
+                await this._imageSender(managedBot, data.chatId, [{
+                    base64: part.base64,
+                    mimeType: part.mimeType || 'image/png',
+                }]);
+            }
+        }
+
+        // Clean up streaming session if it existed
+        if (session) {
+            this._ongoingStreams.delete(streamKey);
+            Logger.info(`Streaming session ${streamKey} completed`);
+        }
+    }
+
+    /**
+     * Handles legacy content format (combined text + separate images array).
+     * @param {Object} data - Message data with text and images properties.
+     * @param {ManagedBot} managedBot - The bot to send through.
+     * @param {StreamSession|undefined} session - Active streaming session if any.
+     * @param {string} streamKey - Key for the streaming session.
+     * @private
+     */
+    async _handleLegacyContent(data, managedBot, session, streamKey) {
         // Split message
         const splitChar = this._messageSplitter?.() || '';
         const parts = splitChar ? data.text.split(splitChar) : [data.text];
@@ -507,6 +597,12 @@ class WebSocketService {
                 .catch((error) => Logger.error('Failed to send final message:', error.message));
         }
 
+        // Send images after anchor text message
+        if (data.images && data.images.length > 0 && this._imageSender) {
+            Logger.info(`Sending ${data.images.length} image(s) to Telegram`);
+            await this._imageSender(managedBot, data.chatId, data.images);
+        }
+
         // Send remaining parts
         if (anchorIndex !== -1) {
             for (let i = anchorIndex + 1; i < parts.length; i++) {
@@ -517,12 +613,11 @@ class WebSocketService {
                 }
             }
         }
-
-        QueueManager.getInstance().releaseJob();
     }
 
     /**
      * Handles AI reply (non-streaming).
+     * Supports both legacy format (text + images) and new ordered contentParts format.
      * @param {Object} data - AI reply data.
      * @private
      */
@@ -537,7 +632,62 @@ class WebSocketService {
             return;
         }
 
-        // Send images first
+        // Check if using new contentParts format (ordered content)
+        if (data.contentParts && Array.isArray(data.contentParts)) {
+            await this._handleOrderedContentNonStreaming(data, managedBot);
+        } else {
+            // Legacy format: text + images (for backwards compatibility)
+            await this._handleLegacyAiReply(data, managedBot);
+        }
+
+        QueueManager.getInstance().releaseJob();
+    }
+
+    /**
+     * Handles ordered content parts for non-streaming replies.
+     * @param {Object} data - Message data with contentParts array.
+     * @param {ManagedBot} managedBot - The bot to send through.
+     * @private
+     */
+    async _handleOrderedContentNonStreaming(data, managedBot) {
+        const splitChar = this._messageSplitter?.() || '';
+
+        Logger.info(`Processing ${data.contentParts.length} ordered content part(s) (non-streaming)`);
+
+        for (let i = 0; i < data.contentParts.length; i++) {
+            const part = data.contentParts[i];
+
+            if (part.type === 'text' && part.content?.trim()) {
+                // Split text by configured character if needed
+                const textParts = splitChar ? part.content.split(splitChar) : [part.content];
+
+                for (let j = 0; j < textParts.length; j++) {
+                    const textPart = textParts[j].trim();
+                    if (!textPart) continue;
+
+                    Logger.info(`Sending text part ${i}:${j}`);
+                    await managedBot.instance.sendMessage(data.chatId, textPart)
+                        .catch((error) => Logger.error('Failed to send text part:', error.message));
+                }
+            } else if (part.type === 'image' && part.base64 && this._imageSender) {
+                // Send image in order
+                Logger.info(`Sending image part ${i}`);
+                await this._imageSender(managedBot, data.chatId, [{
+                    base64: part.base64,
+                    mimeType: part.mimeType || 'image/png',
+                }]);
+            }
+        }
+    }
+
+    /**
+     * Handles legacy AI reply format (combined text + separate images array).
+     * @param {Object} data - Message data with text and images properties.
+     * @param {ManagedBot} managedBot - The bot to send through.
+     * @private
+     */
+    async _handleLegacyAiReply(data, managedBot) {
+        // Send images first (legacy behavior)
         if (data.images && data.images.length > 0 && this._imageSender) {
             Logger.info(`Sending ${data.images.length} image(s) to Telegram`);
             await this._imageSender(managedBot, data.chatId, data.images);
@@ -555,8 +705,6 @@ class WebSocketService {
                     .catch((error) => Logger.error('Failed to send AI reply part:', error.message));
             }
         }
-
-        QueueManager.getInstance().releaseJob();
     }
 
     /**
