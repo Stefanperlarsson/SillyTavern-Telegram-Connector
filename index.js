@@ -713,24 +713,10 @@ async function handleExecuteCommand(data) {
                 try {
                     result = await handleSummarizeCommand(chatId, botId, data.characterName, data.summarizationConfig);
                 } catch (err) {
-                    log('error', 'Failed to generate summary:', err);
+                    log('error', 'Failed to summarize:', err);
                     result = {
                         success: false,
-                        message: `Failed to generate summary: ${err.message}`
-                    };
-                }
-                break;
-
-            // --- Set Summary (Save to Lorebook + New Chat) ---
-            case 'set_summary':
-                try {
-                    const summaryText = data.args && data.args.length > 0 ? data.args[0] : '';
-                    result = await handleSetSummaryCommand(chatId, botId, data.characterName, summaryText, data.summarizationConfig);
-                } catch (err) {
-                    log('error', 'Failed to save summary:', err);
-                    result = {
-                        success: false,
-                        message: `Failed to save summary: ${err.message}`
+                        message: `Failed to summarize: ${err.message}`
                     };
                 }
                 break;
@@ -1168,8 +1154,10 @@ Format the summary as a narrative paragraph, written in past tense from a third-
 Do not include meta-commentary about the conversation itself. Write as if documenting events that actually happened.`;
 
 /**
- * Handles the /summarize command by generating a conversation summary
- * Uses "dry-run" generation that doesn't affect the main chat history
+ * Handles the /summarize command:
+ * 1. Generates a conversation summary using quiet generation
+ * 2. Saves the summary to the configured lorebook
+ * 3. Starts a new chat
  * @param {number} chatId - Telegram chat ID
  * @param {string} botId - Bot identifier
  * @param {string} characterName - Character name
@@ -1191,12 +1179,14 @@ async function handleSummarizeCommand(chatId, botId, characterName, summarizatio
     const charName = characterName || context.name2 || 'Character';
     const userName = context.name1 || 'User';
     
+    // Get lorebook config
+    const lorebookName = summarizationConfig?.lorebookName || 'Character Memories';
+    const entryName = summarizationConfig?.lorebookEntry || 'Past Events';
+    
     log('log', `Generating summary for ${charName}, ${context.chat.length} messages`);
-    log('log', `Config received - has prompt: ${!!summarizationConfig?.prompt}, prompt length: ${summarizationConfig?.prompt?.length || 0}`);
 
     // Get summarization prompt from config or use default
     let prompt = summarizationConfig?.prompt || DEFAULT_SUMMARIZATION_PROMPT;
-    log('log', `Using ${summarizationConfig?.prompt ? 'custom' : 'default'} prompt (${prompt.length} chars)`);
     
     // Replace template variables
     prompt = prompt
@@ -1204,8 +1194,7 @@ async function handleSummarizeCommand(chatId, botId, characterName, summarizatio
         .replace(/\{\{char\}\}/gi, charName);
 
     try {
-        // Generate summary using quiet generation (doesn't affect chat history)
-        // This is a "dry-run" - the output is not added to the conversation
+        // Step 1: Generate summary using quiet generation (doesn't affect chat history)
         const summary = await generateQuietPrompt(prompt, false, false);
         
         if (!summary || summary.trim().length === 0) {
@@ -1217,68 +1206,24 @@ async function handleSummarizeCommand(chatId, botId, characterName, summarizatio
 
         log('log', `Summary generated successfully (${summary.length} chars)`);
 
-        // Return the summary for the user to review
-        // The message format includes instructions for the next step
-        const responseMessage = `**Conversation Summary**\n\n${summary}\n\n---\n_Review and edit this summary as needed, then use /set_summary <text> to save it and start a new chat._`;
-
-        return {
-            success: true,
-            message: responseMessage
-        };
-    } catch (err) {
-        log('error', 'Summary generation failed:', err);
-        return {
-            success: false,
-            message: `Summary generation failed: ${err.message}`
-        };
-    }
-}
-
-/**
- * Handles the /set_summary command by saving summary to lorebook and starting new chat
- * @param {number} chatId - Telegram chat ID
- * @param {string} botId - Bot identifier
- * @param {string} characterName - Character name
- * @param {string} summaryText - The summary text to save
- * @param {Object} summarizationConfig - Config from server (optional)
- * @returns {Promise<{success: boolean, message: string}>}
- */
-async function handleSetSummaryCommand(chatId, botId, characterName, summaryText, summarizationConfig) {
-    const context = SillyTavern.getContext();
-    
-    // Validate summary text
-    if (!summaryText || summaryText.trim().length === 0) {
-        return {
-            success: false,
-            message: 'Please provide summary text. Usage: /set_summary <your summary text>'
-        };
-    }
-
-    // Get config values with defaults
-    const lorebookName = summarizationConfig?.lorebookName || 'Character Memories';
-    const entryName = summarizationConfig?.lorebookEntry || 'Past Events';
-    const charName = characterName || context.name2 || 'Character';
-
-    log('log', `Saving summary to lorebook "${lorebookName}", entry "${entryName}"`);
-
-    try {
-        // Step 1: Save to World Info / Lorebook
-        await appendToWorldInfo(lorebookName, entryName, summaryText.trim(), charName);
+        // Step 2: Save to World Info / Lorebook
+        await appendToWorldInfo(lorebookName, entryName, summary.trim(), charName);
         log('log', 'Summary saved to World Info successfully');
 
-        // Step 2: Start new chat (archive current conversation)
+        // Step 3: Start new chat (archive current conversation)
         await doNewChat({ deleteCurrentChat: false });
         log('log', 'New chat started successfully');
 
+        // Return the summary to show the user what was saved
         return {
             success: true,
-            message: `Summary saved to "${lorebookName}" and new chat started.`
+            message: `**Summary saved to "${lorebookName}"**\n\n${summary}\n\n---\n_New chat started._`
         };
     } catch (err) {
-        log('error', 'Failed to save summary:', err);
+        log('error', 'Summarization failed:', err);
         return {
             success: false,
-            message: `Failed to save summary: ${err.message}`
+            message: `Summarization failed: ${err.message}`
         };
     }
 }

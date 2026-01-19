@@ -181,12 +181,8 @@ async function executeCommand(job, webSocketService) {
         characterName: job.targetCharacter,
     };
 
-    // Include summarization config for summarize/set_summary commands
-    if (job.command === COMMANDS.SUMMARIZE || job.command === COMMANDS.SET_SUMMARY) {
-        Logger.info(`Summarization config check: has summarization=${!!configuration?.summarization}, has prompt=${!!configuration?.summarization?.prompt}`);
-        if (configuration?.summarization?.prompt) {
-            Logger.info(`Custom prompt length: ${configuration.summarization.prompt.length} chars`);
-        }
+    // Include summarization config for summarize command
+    if (job.command === COMMANDS.SUMMARIZE) {
         payload.summarizationConfig = {
             prompt: configuration?.summarization?.prompt || null,
             lorebookName: job.managedBot.lorebookName || null,

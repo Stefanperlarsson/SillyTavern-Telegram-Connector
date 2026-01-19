@@ -437,18 +437,6 @@ class TelegramService {
             return;
         }
 
-        // Set summary command (takes remaining text as argument)
-        if (command === COMMANDS.SET_SUMMARY) {
-            const summaryText = commandArguments.join(' ');
-            if (!summaryText.trim()) {
-                managedBot.instance.sendMessage(chatId, 'Please provide summary text. Usage: /set_summary <your summary text>')
-                    .catch((error) => Logger.error('Failed to send error message:', error.message));
-                return;
-            }
-            this._enqueueCommand(managedBot, message, command, [summaryText]);
-            return;
-        }
-
         // Delete command
         if (command === COMMANDS.DELETE) {
             const count = commandArguments.length > 0 ? parseInt(commandArguments[0]) : 1;
@@ -517,8 +505,7 @@ Chat Management
 /history - Export current chat history as HTML file
 
 Memory & Summarization
-/summarize - Generate a summary of the current conversation
-/set_summary <text> - Save summary to lorebook and start new chat
+/summarize - Summarize conversation, save to lorebook, start new chat
 
 System Management
 /reload - Reload server configuration

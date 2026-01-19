@@ -24,7 +24,6 @@ const COMMANDS = Object.freeze({
     EXIT: 'exit',
     HISTORY: 'history',
     SUMMARIZE: 'summarize',
-    SET_SUMMARY: 'set_summary',
 });
 
 /**
