@@ -20,6 +20,7 @@ const { JOB_TYPES, DEFAULTS } = require('../constants/system');
  * @property {NodeJS.Timeout} timer - Debounce timer.
  * @property {Array<{text: string, files: FileAttachment[]}>} messages - Buffered messages.
  * @property {ManagedBot} managedBot - Bot handling these messages.
+ * @property {number} chatId - Chat ID.
  * @property {number} userId - User ID.
  * @property {string} targetCharacter - Target character name.
  */
@@ -82,7 +83,7 @@ class QueueManager {
         /** @type {boolean} */
         this._isProcessing = false;
 
-        /** @type {Map<number, MessageBuffer>} */
+        /** @type {Map<string, MessageBuffer>} */
         this._messageBuffers = new Map();
 
         /** @type {number} */
@@ -162,6 +163,17 @@ class QueueManager {
     }
 
     /**
+     * Gets a unique buffer key for a chat and bot combination.
+     * @param {string} botId - Bot identifier.
+     * @param {number} chatId - Telegram chat ID.
+     * @returns {string} Buffer key.
+     * @private
+     */
+    _getBufferKey(botId, chatId) {
+        return `${botId}_${chatId}`;
+    }
+
+    /**
      * Adds a message to the debounce buffer.
      * @param {ManagedBot} managedBot - The bot receiving the message.
      * @param {number} chatId - Telegram chat ID.
@@ -170,7 +182,8 @@ class QueueManager {
      * @param {FileAttachment[]} [files] - File attachments.
      */
     debounceMessage(managedBot, chatId, userId, text, files) {
-        let buffer = this._messageBuffers.get(chatId);
+        const bufferKey = this._getBufferKey(managedBot.id, chatId);
+        let buffer = this._messageBuffers.get(bufferKey);
 
         if (buffer) {
             clearTimeout(buffer.timer);
@@ -178,10 +191,11 @@ class QueueManager {
             buffer = {
                 messages: [],
                 managedBot: managedBot,
+                chatId: chatId,
                 userId: userId,
                 targetCharacter: managedBot.characterName,
             };
-            this._messageBuffers.set(chatId, buffer);
+            this._messageBuffers.set(bufferKey, buffer);
         }
 
         if (text || (files && files.length > 0)) {
@@ -189,32 +203,32 @@ class QueueManager {
                 text: text,
                 files: files,
             });
-            Logger.debug(`Buffered message for chat ${chatId} (buffer size: ${buffer.messages.length})`);
+            Logger.debug(`Buffered message for bot ${managedBot.id} chat ${chatId} (buffer size: ${buffer.messages.length})`);
         }
 
         buffer.timer = setTimeout(() => {
-            this._flushMessageBuffer(chatId);
+            this._flushMessageBuffer(bufferKey);
         }, this._debounceMilliseconds);
     }
 
     /**
      * Flushes the message buffer for a chat, creating a single batch job.
-     * @param {number} chatId - The chat ID to flush.
+     * @param {string} bufferKey - The buffer key to flush.
      * @private
      */
-    _flushMessageBuffer(chatId) {
-        const buffer = this._messageBuffers.get(chatId);
+    _flushMessageBuffer(bufferKey) {
+        const buffer = this._messageBuffers.get(bufferKey);
         if (!buffer) {
             return;
         }
 
-        this._messageBuffers.delete(chatId);
+        this._messageBuffers.delete(bufferKey);
 
         if (buffer.messages.length === 0) {
             return;
         }
 
-        Logger.info(`Flushing buffer for chat ${chatId} with ${buffer.messages.length} message(s)`);
+        Logger.info(`Flushing buffer for bot ${buffer.managedBot.characterName} (${buffer.managedBot.id}) chat ${buffer.chatId} with ${buffer.messages.length} message(s)`);
 
         const lastMessage = buffer.messages[buffer.messages.length - 1];
 
@@ -222,7 +236,7 @@ class QueueManager {
         const job = {
             id: '',
             managedBot: buffer.managedBot,
-            chatId: chatId,
+            chatId: buffer.chatId,
             userId: buffer.userId,
             text: lastMessage.text || '(Batch Request)',
             targetCharacter: buffer.targetCharacter,
